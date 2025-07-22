@@ -88,7 +88,7 @@
     *   通过容器启动日志查找随机生成的密码
     *   容器启动后，通过浏览器访问 `http://<你的服务器IP>:5257`。
     *   进入各个设置页面（Emby配置、通用设置），填写必要的 API Key 和服务器信息。
-    *   **点击保存。** 这会在你挂载的 `/config` 目录下（即宿主机的 `/path/to/your/app_data/emby_actor_processor_config` 目录）创建 `config.ini` 文件和 `emby_actor_processor.sqlite` 数据库文件。
+    *   **点击保存。** 这会在你挂载的 `/config` 目录下（即宿主机的 `/path/to/your/app_data/emby_actor_processor/config` 目录）创建 `config.ini` 文件和 `emby_actor_processor.sqlite` 数据库文件。
 
 
 ## ⚙️ 配置项说明
