@@ -1,19 +1,12 @@
 # --- 阶段 1: 构建前端 ---
 FROM node:20-alpine AS frontend-build
-WORKDIR /app
-COPY emby-actor-ui/package.json emby-actor-ui/package-lock.json* ./emby-actor-ui/
 WORKDIR /app/emby-actor-ui
-RUN npm install --no-fund
+
+# 复制前端源码并构建（合并多个操作到单个RUN层）
 COPY emby-actor-ui/ ./
-
-# ✨✨✨ 在 install 之前增加清理缓存的步骤 ✨✨✨
-RUN npm cache clean --force
-
-# 使用 --verbose 参数获取更详细的日志，方便排错
-RUN npm install --no-fund --verbose
-
-COPY emby-actor-ui/ ./
-RUN npm run build
+RUN npm cache clean --force && \
+    npm install --no-fund --verbose && \
+    npm run build
 
 # --- 阶段 2: 构建最终的生产镜像 ---
 FROM python:3.11-slim
@@ -50,36 +43,33 @@ RUN apt-get update && \
         /var/lib/apt/lists/* \
         /var/tmp/*
 
-# 安装 Python 依赖
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# 复制所有应用文件（合并多个COPY操作）
+COPY requirements.txt \
+     web_app.py \
+     core_processor.py \
+     douban.py \
+     tmdb_handler.py \
+     emby_handler.py \
+     utils.py \
+     logger_setup.py \
+     constants.py \
+     web_parser.py \
+     ai_translator.py \
+     watchlist_processor.py \
+     actor_sync_handler.py \
+     actor_utils.py \
+     ./
 
-# 拷贝后端源码
-COPY web_app.py .
-COPY core_processor.py .
-COPY douban.py .
-COPY tmdb_handler.py .
-COPY emby_handler.py .
-COPY utils.py .
-COPY logger_setup.py .
-COPY constants.py .
-COPY web_parser.py .  
-COPY ai_translator.py . 
-COPY watchlist_processor.py .
-COPY actor_sync_handler.py .
-COPY actor_utils.py .
-
-COPY templates/ ./templates/ 
+COPY templates/ ./templates/
+COPY docker/entrypoint.sh /entrypoint.sh
 
 # 从前端构建阶段拷贝编译好的静态文件
 COPY --from=frontend-build /app/emby-actor-ui/dist/. /app/static/
 
-# 复制入口点脚本
-COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
-# 创建用户和组
-RUN mkdir -p ${HOME} && \
+# 安装Python依赖、设置权限、创建用户（合并多个RUN操作）
+RUN pip install --no-cache-dir -r requirements.txt && \
+    chmod +x /entrypoint.sh && \
+    mkdir -p ${HOME} && \
     groupadd -r embyactor -g 918 && \
     useradd -r embyactor -g embyactor -d ${HOME} -s /bin/bash -u 918
 
