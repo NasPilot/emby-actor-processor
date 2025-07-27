@@ -2,11 +2,14 @@
 FROM node:20-alpine AS frontend-build
 WORKDIR /app/emby-actor-ui
 
-# 复制前端源码并构建（合并多个操作到单个RUN层）
-COPY emby-actor-ui/ ./
+# 先复制package文件以利用Docker层缓存
+COPY emby-actor-ui/package*.json ./
 RUN npm cache clean --force && \
-    npm install --no-fund --verbose && \
-    npm run build
+    npm install --no-fund --verbose
+
+# 再复制源码并构建
+COPY emby-actor-ui/ ./
+RUN npm run build
 
 # --- 阶段 2: 构建最终的生产镜像 ---
 FROM python:3.11-slim
@@ -43,9 +46,21 @@ RUN apt-get update && \
         /var/lib/apt/lists/* \
         /var/tmp/*
 
-# 复制所有应用文件（合并多个COPY操作）
-COPY requirements.txt \
-     web_app.py \
+# 先复制requirements.txt以利用pip缓存
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制入口脚本并设置权限
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# 创建用户和目录
+RUN mkdir -p ${HOME} && \
+    groupadd -r embyactor -g 918 && \
+    useradd -r embyactor -g embyactor -d ${HOME} -s /bin/bash -u 918
+
+# 复制应用源码（这些文件变化频繁，放在最后以最大化缓存利用）
+COPY web_app.py \
      core_processor.py \
      douban.py \
      tmdb_handler.py \
@@ -61,17 +76,9 @@ COPY requirements.txt \
      ./
 
 COPY templates/ ./templates/
-COPY docker/entrypoint.sh /entrypoint.sh
 
 # 从前端构建阶段拷贝编译好的静态文件
 COPY --from=frontend-build /app/emby-actor-ui/dist/. /app/static/
-
-# 安装Python依赖、设置权限、创建用户（合并多个RUN操作）
-RUN pip install --no-cache-dir -r requirements.txt && \
-    chmod +x /entrypoint.sh && \
-    mkdir -p ${HOME} && \
-    groupadd -r embyactor -g 918 && \
-    useradd -r embyactor -g embyactor -d ${HOME} -s /bin/bash -u 918
 
 # 声明 /config 目录为数据卷
 VOLUME [ "${CONFIG_DIR}" ]
