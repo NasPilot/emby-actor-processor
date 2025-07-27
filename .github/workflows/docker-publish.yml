@@ -39,11 +39,11 @@ jobs:
         with:
           images: ${{ secrets.DOCKER_USERNAME }}/emby-actor-processor
           tags: |
-            # 规则1: 如果事件是推送到一个分支，就用分支名作为 Docker 标签。
-            # 这会自动为默认分支(main)打上 'latest' 标签。
-            type=ref,event=branch
-
-            # 规则2: 如果事件是推送一个 Git 标签，就用语义化版本作为 Docker 标签。
+            # 规则1: main分支使用latest标签
+            type=raw,value=latest,enable={{is_default_branch}}
+            # 规则2: 其他分支使用分支名作为标签
+            type=ref,event=branch,enable={{!is_default_branch}}
+            # 规则3: 如果事件是推送一个 Git 标签，就用语义化版本作为 Docker 标签。
             type=semver,pattern={{version}}
 
       - name: Build and push Docker image
