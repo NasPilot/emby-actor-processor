@@ -41,10 +41,12 @@ jobs:
           tags: |
             # 规则1: main分支使用latest标签
             type=raw,value=latest,enable={{is_default_branch}}
-            # 规则2: 其他分支使用分支名作为标签
-            type=ref,event=branch,enable={{!is_default_branch}}
+            # 规则2: 非main分支使用分支名作为标签
+            type=ref,event=branch
             # 规则3: 如果事件是推送一个 Git 标签，就用语义化版本作为 Docker 标签。
             type=semver,pattern={{version}}
+          flavor: |
+            latest=false
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
