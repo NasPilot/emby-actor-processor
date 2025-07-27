@@ -19,8 +19,8 @@ import constants
 import logging
 import actor_utils
 from cachetools import TTLCache
-from actor_utils import ActorDBManager
-from actor_utils import get_db_connection as get_central_db_connection
+from db_handler import ActorDBManager
+from db_handler import get_db_connection as get_central_db_connection
 from ai_translator import AITranslator
 from utils import LogDBManager, get_override_path_for_item
 from watchlist_processor import WatchlistProcessor
@@ -65,7 +65,7 @@ class MediaProcessor:
             try:
                 # --- ✨✨✨ 核心修改区域 START ✨✨✨ ---
 
-                # 1. 从配置中获取冷却时间 (这部分逻辑您可能已经有了)
+                # 1. 从配置中获取冷却时间 
                 douban_cooldown = self.config.get(constants.CONFIG_OPTION_DOUBAN_DEFAULT_COOLDOWN, 2.0)
                 
                 # 2. 从配置中获取 Cookie，使用我们刚刚在 constants.py 中定义的常量
@@ -735,7 +735,7 @@ class MediaProcessor:
         log_prefix = f"[{'在线模式' if force_fetch_from_tmdb else '本地模式'}]"
         # --- 定义动画片 ---
         genres = item_details_from_emby.get("Genres", [])
-        is_animation = "Animation" in genres or "动画" in genres
+        is_animation = "Animation" in genres or "动画" in genres or "Documentary" in genres or "纪录" in genres
         # ★★★ 现在 item_name_for_log 已经定义好了 ★★★
         original_emby_actor_count = len(item_details_from_emby.get("People", []))
         
@@ -763,33 +763,35 @@ class MediaProcessor:
                 logger.info(f"{log_prefix} 检测到缓存文件不存在，为 '{item_name_for_log}' 自动执行缓存重建...")
                 logger.debug(f"  - 目标文件路径: {json_file_path}")
 
-            # 1. 删除旧的 override 和 cache 缓存文件
+            # --- ✨✨✨ 1. 清理时，只记录 cache 目录删除的文件数作为目标 ✨✨✨ ---
+            files_deleted_from_cache = 0
             dirs_to_clean = [item_override_dir, item_cache_dir]
-            
             for target_dir in dirs_to_clean:
                 if os.path.isdir(target_dir):
-                    files_deleted_count = 0
+                    files_deleted_in_dir = 0
                     try:
-                        # 使用 os.walk 遍历目录及其所有子目录
                         for dirpath, _, filenames in os.walk(target_dir):
                             for filename in filenames:
                                 if filename.lower().endswith('.json'):
                                     file_to_delete = os.path.join(dirpath, filename)
                                     try:
                                         os.remove(file_to_delete)
-                                        files_deleted_count += 1
+                                        files_deleted_in_dir += 1
                                     except OSError as e_remove:
                                         logger.error(f"{log_prefix} 删除文件 {file_to_delete} 时失败: {e_remove}")
                         
-                        if files_deleted_count > 0:
-                            logger.debug(f"{log_prefix} 成功从 {target_dir} 删除了 {files_deleted_count} 个 .json 文件。")
-                        else:
-                            logger.debug(f"{log_prefix} 在 {target_dir} 中未找到需要删除的 .json 文件。")
-
+                        if files_deleted_in_dir > 0:
+                            logger.debug(f"{log_prefix} 成功从 {target_dir} 删除了 {files_deleted_in_dir} 个 .json 文件。")
+                        
+                        # 只在处理 cache 目录时，才更新我们的目标计数器
+                        if target_dir == item_cache_dir:
+                            files_deleted_from_cache = files_deleted_in_dir
+                            
                     except Exception as e_walk:
                         logger.error(f"{log_prefix} 遍历目录 {target_dir} 进行清理时失败: {e_walk}", exc_info=True)
-                else:
-                    logger.debug(f"{log_prefix} 目录不存在，无需清理: {target_dir}")
+            
+            if files_deleted_from_cache > 0:
+                logger.info(f"{log_prefix} 清理完毕，等待刮削器重新生成 {files_deleted_from_cache} 个缓存文件。")
 
             # 2. 触发Emby进行“替换所有元数据”的刷新
             logger.info(f"{log_prefix} 正在触发Emby对 '{item_name_for_log}' 进行“替换所有元数据”的刷新...")
@@ -805,32 +807,63 @@ class MediaProcessor:
                 logger.error(f"{log_prefix} ❌ 触发Emby刷新失败，处理中止。")
                 return False
 
-            # 3. 【【【【【 新增核心逻辑：等待缓存文件生成 】】】】】
+            # --- ✨✨✨ 3. 使用修正后的等待逻辑 ✨✨✨ ---
             logger.info(f"{log_prefix} 刷新已触发，现在开始等待新的缓存文件生成...")
-            
-            # 设置等待参数：最多等12次，每次5秒，总共1分钟超时
+            file_found = False
+            last_file_count = -1
+            stable_checks = 0
             max_retries = self.config.get("rebuild_max_retries", 12)
             wait_interval = self.config.get("rebuild_wait_interval", 5)
-            file_found = False
+            stability_threshold = self.config.get("rebuild_stability_threshold", 2)
 
             for i in range(max_retries):
                 if self.is_stop_requested():
                     logger.warning(f"{log_prefix} 在等待缓存文件生成期间收到停止信号，处理中止。")
-                    # 直接返回False，中断当前项目处理
                     return False
-                if os.path.exists(json_file_path):
-                    logger.info(f"{log_prefix} ✅ 在 {i * wait_interval} 秒后，成功找到新生成的缓存文件: {json_file_path}")
+
+                main_file_exists = os.path.exists(json_file_path)
+                
+                if item_type == "Series":
+                    if not main_file_exists:
+                        logger.info(f"{log_prefix} 等待主文件 {base_json_filename}... (尝试 {i+1}/{max_retries})")
+                    else:
+                        try:
+                            current_file_count = len([f for f in os.listdir(item_cache_dir) if f.lower().endswith('.json')])
+                        except FileNotFoundError:
+                            current_file_count = 0
+
+                        # 使用正确的目标数进行日志记录
+                        log_target_count = files_deleted_from_cache if files_deleted_from_cache > 0 else "N/A"
+                        logger.info(f"{log_prefix} 等待中... (尝试 {i+1}/{max_retries}) | 当前/目标文件数: {current_file_count}/{log_target_count} | 稳定检查: {stable_checks}/{stability_threshold}")
+
+                        # 优先条件1: 文件数已恢复 (使用正确的目标数)
+                        if files_deleted_from_cache > 0 and current_file_count >= files_deleted_from_cache:
+                            logger.info(f"{log_prefix} ✅ 文件数量 ({current_file_count}) 已达到或超过目标数量 ({files_deleted_from_cache})，认为缓存生成完毕。")
+                            file_found = True
+                            break
+
+                        # 备用条件2: 文件数稳定
+                        if current_file_count > last_file_count:
+                            stable_checks = 0
+                            last_file_count = current_file_count
+                        else:
+                            stable_checks += 1
+                        
+                        if stable_checks >= stability_threshold:
+                            logger.info(f"{log_prefix} ✅ 文件数量已连续 {stability_threshold} 次未变化，认为缓存生成完毕。")
+                            file_found = True
+                            break
+                
+                elif item_type == "Movie" and main_file_exists:
+                    logger.info(f"{log_prefix} ✅ 成功找到电影缓存文件: {json_file_path}")
                     file_found = True
                     break
                 
-                logger.info(f"{log_prefix} 文件尚不存在，等待 {wait_interval} 秒... (尝试 {i+1}/{max_retries})")
                 time.sleep(wait_interval)
             
             if not file_found:
-                logger.error(f"{log_prefix} ❌ 等待超时！在 {max_retries * wait_interval} 秒后仍未找到缓存文件。处理中止。")
+                logger.error(f"{log_prefix} ❌ 等待超时！在 {max_retries * wait_interval} 秒后仍未找到缓存文件或文件数量未稳定。处理中止。")
                 return False
-            
-            # 如果文件找到了，就不做任何事，让程序自然地流向下面的常规处理逻辑
 
         # ★★★ 正常的本地处理模式 ★★★
         # (无论是直接进入，还是经过了上面的重建等待流程，都会执行这里)
@@ -863,20 +896,25 @@ class MediaProcessor:
                 if not base_json_data_original:
                     raise ValueError(f"无法读取或解析JSON文件: {json_file_path}")
 
-                # 2. 处理演员表 (您现有的逻辑，无需改动)
+                # 2. 处理演员表
                 full_tmdb_cast_as_base = []
                 if item_type == "Movie":
                     full_tmdb_cast_as_base = base_json_data_original.get("casts", {}).get("cast", [])
+                
                 elif item_type == "Series":
-                    full_tmdb_cast_as_base = base_json_data_original.get("credits", {}).get("cast", [])
+                    # ✨✨✨ 直接调用新的聚合函数 ✨✨✨
+                    full_tmdb_cast_as_base = self._aggregate_series_cast_from_cache(
+                        base_cache_dir=base_cache_dir,
+                        item_name_for_log=item_name_for_log
+                    )
                 
                 intermediate_cast = self._process_cast_list_from_local(
                     full_tmdb_cast_as_base,
                     item_details_from_emby, 
                     cursor,
                     self.tmdb_api_key,
-                    self.get_stop_event()  # 假设您有一个方法来获取停止事件
-                ) # 您的演员处理函数
+                    self.get_stop_event()  
+                ) 
                 final_cast_perfect = actor_utils.format_and_complete_cast_list(
                     intermediate_cast, 
                     is_animation, 
@@ -933,6 +971,10 @@ class MediaProcessor:
 
                         # --- 步骤2: 遍历每一个找到的分集文件，修改并写入覆盖目录 ---
                         for episode_filename in sorted(episode_files_to_process):
+                            # ✨✨✨ 新增停止检查 ✨✨✨
+                            if self.is_stop_requested():
+                                logger.warning(f"分集处理循环被用户中止。")
+                                raise InterruptedError("任务中止")
                             local_child_path = os.path.join(base_cache_dir, episode_filename)
                             
                             try:
@@ -1261,6 +1303,9 @@ class MediaProcessor:
                     cursor = conn.cursor()
 
                     for i, actor in enumerate(translated_cast):
+                        if self.is_stop_requested():
+                            logger.warning(f"一键翻译（降级模式）被用户中止。")
+                            break # 这里使用 break 更安全，可以直接跳出循环
                         # 【【【 修复点 3：使用正确的参数调用 translate_actor_field 】】】
                         
                         # 翻译演员名
@@ -1351,7 +1396,6 @@ class MediaProcessor:
                             # 只有在清洗后的新角色名有效，且与清洗后的旧角色名确实不同时，才进行操作
                             if cleaned_new_role and cleaned_new_role != cleaned_original_role:
                                 try:
-                                    # ★★★ 核心修改：调用您现有的函数并开启反查模式 ★★★
                                     # 使用“修改前的中文名”（例如 "杰克萨利"）进行反向查找
                                     cache_entry = self.actor_db_manager.get_translation_from_db(
                                         text=cleaned_original_role,
@@ -1394,7 +1438,7 @@ class MediaProcessor:
                     #      应用与自动处理流程完全相同的最终格式化和补全逻辑
                     # =================================================================
                     genres = item_details.get("Genres", [])
-                    is_animation = "Animation" in genres or "动画" in genres
+                    is_animation = "Animation" in genres or "动画" in genres or "Documentary" in genres or "纪录" in genres
                     
                     logger.debug("正在对合并后的演员列表应用最终的格式化、补全和排序...")
                     final_cast_perfect = actor_utils.format_and_complete_cast_list(
@@ -1449,6 +1493,9 @@ class MediaProcessor:
                         logger.info(f"手动处理：开始为所有分集注入手动编辑后的演员表...")
                         # (这部分逻辑已经很精简了，直接复用即可)
                         for filename in os.listdir(base_cache_dir):
+                            if self.is_stop_requested():
+                                logger.warning(f"手动保存的分集处理循环被用户中止。")
+                                raise InterruptedError("任务中止")
                             if filename.startswith("season-") and "-episode-" in filename and filename.endswith(".json"):
                                 child_json_original = _read_local_json(os.path.join(base_cache_dir, filename))
                                 if child_json_original:
@@ -1529,16 +1576,26 @@ class MediaProcessor:
 
             tmdb_id = emby_details.get("ProviderIds", {}).get("Tmdb")
             item_type = emby_details.get("Type")
+            item_name_for_log = emby_details.get("Name", f"未知(ID:{item_id})")
             if not tmdb_id: raise ValueError(f"项目 {item_id} 缺少 TMDb ID")
 
             # 2. 从本地 cache 文件读取最可靠的演员列表
             cache_folder_name = "tmdb-movies2" if item_type == "Movie" else "tmdb-tv"
             base_cache_dir = os.path.join(self.local_data_path, "cache", cache_folder_name, tmdb_id)
             base_json_filename = "all.json" if item_type == "Movie" else "series.json"
-            tmdb_data = _read_local_json(os.path.join(base_cache_dir, base_json_filename))
-            if not tmdb_data: raise ValueError("未找到本地 TMDb 缓存文件")
+            full_cast_from_cache = []
             
-            full_cast_from_cache = tmdb_data.get("credits", {}).get("cast", []) or tmdb_data.get("casts", {}).get("cast", [])
+            if item_type == "Movie":
+                tmdb_data = _read_local_json(os.path.join(base_cache_dir, base_json_filename))
+                if not tmdb_data: raise ValueError("未找到本地 TMDb 缓存文件")
+                full_cast_from_cache = tmdb_data.get("casts", {}).get("cast", [])
+            
+            elif item_type == "Series":
+                # ✨✨✨ 同样直接调用新的聚合函数 ✨✨✨
+                full_cast_from_cache = self._aggregate_series_cast_from_cache(
+                    base_cache_dir=base_cache_dir,
+                    item_name_for_log=item_name_for_log
+                )
 
             # 3. 将完整的演员列表存入内存缓存
             self.manual_edit_cache[item_id] = full_cast_from_cache
@@ -1731,7 +1788,13 @@ class MediaProcessor:
                     try:
                         # 使用 os.walk 遍历目标目录及其所有子目录
                         for dirpath, _, filenames in os.walk(full_path):
+                            if self.is_stop_requested():
+                                logger.warning("缓存清除任务被中止 (遍历目录时)。")
+                                break # 跳出 for dirpath... 循环
                             for filename in filenames:
+                                if self.is_stop_requested():
+                                    logger.warning("缓存清除任务被中止 (处理文件时)。")
+                                    break # 跳出 for filename... 循环
                                 # 检查文件是否以 .json 结尾 (不区分大小写)
                                 if filename.lower().endswith('.json'):
                                     file_to_delete = os.path.join(dirpath, filename)
@@ -1875,5 +1938,94 @@ class MediaProcessor:
         except Exception as e:
             logger.error(f"{log_prefix} 为 '{item_name_for_log}' 同步图片时发生未知错误: {e}", exc_info=True)
             return False
+    # --- 聚合演员表 ---
+    def _aggregate_series_cast_from_cache(self, base_cache_dir: str, item_name_for_log: str) -> List[Dict[str, Any]]:
+        """
+        【V3 - 最终修复版】聚合一个剧集所有本地缓存JSON文件中的演员列表。
+
+        此函数会扫描指定TMDb缓存目录，读取series.json、所有season-*.json和
+        season-*-episode-*.json文件，提取其中的演员和客串演员，
+        然后去重并形成一个完整的演员列表。
+
+        Args:
+            base_cache_dir (str): 剧集的TMDb缓存根目录路径。
+            item_name_for_log (str): 用于日志记录的媒体项目名称。
+
+        Returns:
+            List[Dict[str, Any]]: 聚合、去重并排序后的完整演员列表。
+        """
+        logger.info(f"【演员聚合】开始为 '{item_name_for_log}' 聚合所有JSON文件中的演员...")
+        
+        aggregated_cast_map = {}
+        
+        # 1. 优先处理主文件
+        base_json_filename = "series.json"
+        main_series_json_path = os.path.join(base_cache_dir, base_json_filename)
+        
+        main_data = _read_local_json(main_series_json_path)
+        if main_data:
+            # 主演列表的优先级最高
+            main_cast = main_data.get("credits", {}).get("cast", [])
+            for actor in main_cast:
+                actor_id = actor.get("id")
+                if actor_id:
+                    aggregated_cast_map[actor_id] = actor
+            logger.debug(f"  -> 从 {base_json_filename} 中加载了 {len(aggregated_cast_map)} 位主演员。")
+        else:
+            logger.warning(f"  -> 未找到主剧集文件: {main_series_json_path}，将只处理子文件。")
+
+        # 2. 扫描并聚合所有子文件（分季、分集）
+        try:
+            # 获取所有需要处理的子文件名
+            child_json_files = [
+                f for f in os.listdir(base_cache_dir) 
+                if f != base_json_filename and f.startswith("season-") and f.lower().endswith(".json")
+            ]
+            
+            if child_json_files:
+                logger.debug(f"  -> 发现 {len(child_json_files)} 个额外的季/集JSON文件需要处理。")
+
+                for json_filename in sorted(child_json_files):
+                    file_path = os.path.join(base_cache_dir, json_filename)
+                    child_data = _read_local_json(file_path)
+                    if not child_data:
+                        continue
+
+                    # ✨✨✨ 核心修复：从 "credits" 对象中安全地获取 cast 和 guest_stars ✨✨✨
+                    credits_data = child_data.get("credits", {})
+                    
+                    # 将两个列表安全地合并成一个待处理列表
+                    actors_to_process = credits_data.get("cast", []) + credits_data.get("guest_stars", [])
+                    
+                    if not actors_to_process:
+                        continue
+
+                    # 遍历并添加新演员
+                    for actor in actors_to_process:
+                        actor_id = actor.get("id")
+                        # 确保演员有ID
+                        if not actor_id:
+                            continue
+                        
+                        # 如果演员ID还未记录，就添加他/她
+                        if actor_id not in aggregated_cast_map:
+                            # ✨ 新增调试日志，用于追踪
+                            logger.trace(f"    -> 新增演员 (ID: {actor_id}): {actor.get('name')}")
+                            
+                            # 为客串演员设置一个默认的高 'order' 值，确保他们排在主演后面
+                            if 'order' not in actor:
+                                actor['order'] = 999 
+                            aggregated_cast_map[actor_id] = actor
+
+        except FileNotFoundError:
+            logger.warning(f"  -> 缓存目录 {base_cache_dir} 不存在，无法聚合子项目演员。")
+        
+        # 3. 将最终结果从字典转为列表并排序
+        full_aggregated_cast = list(aggregated_cast_map.values())
+        full_aggregated_cast.sort(key=lambda x: x.get('order', 999))
+        
+        logger.info(f"【演员聚合】完成。共为 '{item_name_for_log}' 聚合了 {len(full_aggregated_cast)} 位独立演员。")
+        
+        return full_aggregated_cast
     def close(self):
         if self.douban_api: self.douban_api.close()

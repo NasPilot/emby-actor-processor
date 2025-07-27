@@ -2,25 +2,29 @@
 import os
 import re
 import json
-import inspect
 import sqlite3
-import shutil
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from actor_sync_handler import UnifiedSyncHandler
+from db_handler import ActorDBManager
 import emby_handler
+import moviepilot_handler
 import utils
+import extensions
+from extensions import (
+    login_required, 
+    task_lock_required, 
+    processor_ready_required
+)
 from utils import LogDBManager
-import configparser
-from flask import Flask, render_template, request, redirect, url_for, jsonify, flash, stream_with_context, send_from_directory,Response, abort
+from flask import Flask, render_template, request, redirect, url_for, jsonify, flash, stream_with_context, send_from_directory,Response, abort, session
 from werkzeug.utils import safe_join, secure_filename
-from queue import Queue
-from functools import wraps
 from utils import get_override_path_for_item
 from watchlist_processor import WatchlistProcessor
 import threading
 import time
 from datetime import datetime
 import requests
+import tmdb_handler
 from douban import DoubanApi
 from typing import Optional, Dict, Any, List, Tuple, Union # 确保 List 被导入
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -28,184 +32,59 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz # 用于处理时区
 import atexit # 用于应用退出处理
 from core_processor import MediaProcessor
-import csv
-from io import StringIO
+from actor_subscription_processor import ActorSubscriptionProcessor
 from werkzeug.security import generate_password_hash, check_password_hash
 import secrets
-from actor_utils import ActorDBManager, enrich_all_actor_aliases_task
-from actor_utils import get_db_connection as get_central_db_connection
+from actor_utils import enrich_all_actor_aliases_task
+import db_handler
+from db_handler import get_db_connection as get_central_db_connection
 from flask import session
 from croniter import croniter
 import logging
+# --- 导入蓝图 ---
+from routes.watchlist import watchlist_bp
+from routes.collections import collections_bp
+from routes.actor_subscriptions import actor_subscriptions_bp
+from routes.logs import logs_bp
 # --- 核心模块导入 ---
 import constants # 你的常量定义\
 import logging
 from logger_setup import frontend_log_queue, add_file_handler # 日志记录器和前端日志队列
 import utils       # 例如，用于 /api/search_media
+import config_manager
+import task_manager
 # --- 核心模块导入结束 ---
 logger = logging.getLogger(__name__)
 logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
-static_folder='static'
-app = Flask(__name__)
-# CORS(app) # 最简单的全局启用 CORS，允许所有源
-# app.secret_key = os.urandom(24) # 用于 flash 消息等
-# ✨✨✨ 新增：导入我们创建的网页解析器 ✨✨✨
+app = Flask(__name__, static_folder='static')
+app.secret_key = os.urandom(24)
+# ✨✨✨ 导入网页解析器 ✨✨✨
 try:
     from web_parser import parse_cast_from_url, ParserError
     WEB_PARSER_AVAILABLE = True
 except ImportError:
     logger.error("web_parser.py 未找到或无法导入，从URL提取功能将不可用。")
     WEB_PARSER_AVAILABLE = False
-# vue_dev_server_origin = "http://localhost:5173"
-# CORS(app, resources={r"/api/*": {"origins": vue_dev_server_origin}})
-# --- 路径和配置定义 ---
-APP_DATA_DIR_ENV = os.environ.get("APP_DATA_DIR")
-app = Flask(__name__, static_folder='static')
-app.secret_key = os.urandom(24)
-# ✨✨✨ “配置清单” ✨✨✨
-CONFIG_DEFINITION = {
-    # [Emby]
-    constants.CONFIG_OPTION_EMBY_SERVER_URL: (constants.CONFIG_SECTION_EMBY, 'string', ""),
-    constants.CONFIG_OPTION_EMBY_API_KEY: (constants.CONFIG_SECTION_EMBY, 'string', ""),
-    constants.CONFIG_OPTION_EMBY_USER_ID: (constants.CONFIG_SECTION_EMBY, 'string', ""),
-    constants.CONFIG_OPTION_REFRESH_AFTER_UPDATE: (constants.CONFIG_SECTION_EMBY, 'boolean', True),
-    constants.CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS: (constants.CONFIG_SECTION_EMBY, 'list', []),
-
-    # [TMDB]
-    constants.CONFIG_OPTION_TMDB_API_KEY: (constants.CONFIG_SECTION_TMDB, 'string', ""),
-
-    # [DoubanAPI]
-    constants.CONFIG_OPTION_DOUBAN_DEFAULT_COOLDOWN: (constants.CONFIG_SECTION_API_DOUBAN, 'float', 1.0),
-    constants.CONFIG_OPTION_DOUBAN_COOKIE: (constants.CONFIG_SECTION_API_DOUBAN, 'string', ""),
-
-    # [Translation]
-    constants.CONFIG_OPTION_TRANSLATOR_ENGINES: (constants.CONFIG_SECTION_TRANSLATION, 'list', constants.DEFAULT_TRANSLATOR_ENGINES_ORDER),
-    
-    # [LocalDataSource]
-    constants.CONFIG_OPTION_LOCAL_DATA_PATH: (constants.CONFIG_SECTION_LOCAL_DATA, 'string', ""),
-
-    # [General]
-    "delay_between_items_sec": ("General", 'float', 0.5),
-    constants.CONFIG_OPTION_MIN_SCORE_FOR_REVIEW: ("General", 'float', constants.DEFAULT_MIN_SCORE_FOR_REVIEW),
-    constants.CONFIG_OPTION_PROCESS_EPISODES: ("General", 'boolean', True),
-    constants.CONFIG_OPTION_SYNC_IMAGES: ("General", 'boolean', False),
-    constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS: ("General", 'int', constants.DEFAULT_MAX_ACTORS_TO_PROCESS),
-
-    # [Network]
-    "user_agent": ("Network", 'string', 'Mozilla/5.0 ...'), # 省略默认值
-    "accept_language": ("Network", 'string', 'zh-CN,zh;q=0.9,en;q=0.8'),
-
-    # [AITranslation]
-    constants.CONFIG_OPTION_AI_TRANSLATION_ENABLED: (constants.CONFIG_SECTION_AI_TRANSLATION, 'boolean', False),
-    constants.CONFIG_OPTION_AI_PROVIDER: (constants.CONFIG_SECTION_AI_TRANSLATION, 'string', "openai"),
-    constants.CONFIG_OPTION_AI_API_KEY: (constants.CONFIG_SECTION_AI_TRANSLATION, 'string', ""),
-    constants.CONFIG_OPTION_AI_MODEL_NAME: (constants.CONFIG_SECTION_AI_TRANSLATION, 'string', "deepseek-ai/DeepSeek-V2.5"),
-    constants.CONFIG_OPTION_AI_BASE_URL: (constants.CONFIG_SECTION_AI_TRANSLATION, 'string', "https://api.siliconflow.cn/v1"),
-    constants.CONFIG_OPTION_AI_TRANSLATION_MODE: (
-        constants.CONFIG_SECTION_AI_TRANSLATION, # 属于 AITranslation 部分
-        'string',                                # 它的值是一个字符串
-        'fast'                                   # 默认值为 'fast' (翻译模式)
-    ),
-
-    # [Scheduler]
-    constants.CONFIG_OPTION_SCHEDULE_ENABLED: (constants.CONFIG_SECTION_SCHEDULER, 'boolean', False),
-    constants.CONFIG_OPTION_SCHEDULE_CRON: (constants.CONFIG_SECTION_SCHEDULER, 'string', "0 3 * * *"),
-    constants.CONFIG_OPTION_SCHEDULE_FORCE_REPROCESS: (constants.CONFIG_SECTION_SCHEDULER, 'boolean', False),
-    constants.CONFIG_OPTION_SCHEDULE_SYNC_MAP_ENABLED: (constants.CONFIG_SECTION_SCHEDULER, 'boolean', False),
-    constants.CONFIG_OPTION_SCHEDULE_SYNC_MAP_CRON: (constants.CONFIG_SECTION_SCHEDULER, 'string', "0 1 * * *"),
-    constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_ENABLED: (constants.CONFIG_SECTION_SCHEDULER, 'boolean', False),
-    constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_CRON: (constants.CONFIG_SECTION_SCHEDULER, 'string', constants.DEFAULT_SCHEDULE_WATCHLIST_CRON),
-    constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_ENABLED: (constants.CONFIG_SECTION_SCHEDULER, 'boolean', False),
-    constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_CRON: (constants.CONFIG_SECTION_SCHEDULER, 'string', "30 2 * * *"),
-    constants.CONFIG_OPTION_SCHEDULE_ENRICH_DURATION_MINUTES: (constants.CONFIG_SECTION_SCHEDULER, 'int', 420), # 默认420分钟 = 7小时
-    constants.CONFIG_OPTION_SCHEDULE_ENRICH_SYNC_INTERVAL_DAYS: (constants.CONFIG_SECTION_SCHEDULER, 'int', constants.DEFAULT_ENRICH_ALIASES_SYNC_INTERVAL_DAYS),
-    constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_ENABLED: (constants.CONFIG_SECTION_SCHEDULER, 'boolean', True),
-    constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_CRON: (constants.CONFIG_SECTION_SCHEDULER, 'string', constants.DEFAULT_SCHEDULE_ACTOR_CLEANUP_CRON),
-
-    # [Authentication]
-    constants.CONFIG_OPTION_AUTH_ENABLED: (constants.CONFIG_SECTION_AUTH, 'boolean', False),
-    constants.CONFIG_OPTION_AUTH_USERNAME: (constants.CONFIG_SECTION_AUTH, 'string', constants.DEFAULT_USERNAME),
-    constants.CONFIG_OPTION_ACTOR_ROLE_ADD_PREFIX: (constants.CONFIG_SECTION_ACTOR, 'boolean', False),
-
-    # ★★★日志轮转配置 ★★★
-    constants.CONFIG_OPTION_LOG_ROTATION_SIZE_MB: (
-        constants.CONFIG_SECTION_LOGGING, 
-        'int', 
-        constants.DEFAULT_LOG_ROTATION_SIZE_MB
-    ),
-    constants.CONFIG_OPTION_LOG_ROTATION_BACKUPS: (
-        constants.CONFIG_SECTION_LOGGING, 
-        'int', 
-        constants.DEFAULT_LOG_ROTATION_BACKUPS
-    ),
-
-}
-if APP_DATA_DIR_ENV:
-    # 如果在 Docker 中，并且设置了 APP_DATA_DIR 环境变量 (例如设置为 "/config")
-    PERSISTENT_DATA_PATH = APP_DATA_DIR_ENV
-    logger.info(f"检测到 APP_DATA_DIR 环境变量，将使用持久化数据路径: {PERSISTENT_DATA_PATH}")
-else:
-    # 本地开发环境：在 web_app.py 文件所在的目录的上一级，创建一个名为 'local_data' 的文件夹
-    # 或者，如果你希望 local_data 与 web_app.py 同级，可以调整 BASE_DIR_FOR_DATA
-    # BASE_DIR_FOR_DATA = os.path.dirname(os.path.abspath(__file__)) # web_app.py 所在目录
-    # PERSISTENT_DATA_PATH = os.path.join(BASE_DIR_FOR_DATA, "local_data")
-    
-    # 更常见的本地开发做法：数据目录在项目根目录（假设 web_app.py 在项目根目录或子目录）
-    # 如果 web_app.py 在项目根目录:
-    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-    # 如果 web_app.py 在类似 src/ 的子目录，你可能需要 os.path.dirname(PROJECT_ROOT)
-    PERSISTENT_DATA_PATH = os.path.join(PROJECT_ROOT, "local_data")
-    logger.debug(f"未检测到 APP_DATA_DIR 环境变量，将使用本地开发数据路径: {PERSISTENT_DATA_PATH}")
-    LOG_DIRECTORY = os.path.join(PERSISTENT_DATA_PATH, 'logs')
-
-# 确保这个持久化数据目录存在 (无论是在本地还是在容器内)
-try:
-    if not os.path.exists(PERSISTENT_DATA_PATH):
-        os.makedirs(PERSISTENT_DATA_PATH, exist_ok=True)
-        logger.info(f"持久化数据目录已创建/确认: {PERSISTENT_DATA_PATH}")
-except OSError as e:
-    logger.error(f"创建持久化数据目录 '{PERSISTENT_DATA_PATH}' 失败: {e}。程序可能无法正常读写配置文件和数据库。")
-    # 在这种情况下，程序可能无法继续，可以考虑退出或抛出异常
-    # raise RuntimeError(f"无法创建必要的数据目录: {PERSISTENT_DATA_PATH}") from e
-
-CONFIG_FILE_NAME = getattr(constants, 'CONFIG_FILE_NAME', "config.ini")
-CONFIG_FILE_PATH = os.path.join(PERSISTENT_DATA_PATH, CONFIG_FILE_NAME)
-
-DB_NAME = getattr(constants, 'DB_NAME', "emby_actor_processor.sqlite")
-DB_PATH = os.path.join(PERSISTENT_DATA_PATH, DB_NAME)
-
 #过滤底层日志
 logging.getLogger("requests").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
-logger.info(f"配置文件路径 (CONFIG_FILE_PATH) 设置为: {CONFIG_FILE_PATH}")
-logger.info(f"数据库文件路径 (DB_PATH) 设置为: {DB_PATH}")
 
 # --- 全局变量 ---
+EMBY_SERVER_ID: Optional[str] = None # ★★★ 新增：用于存储 Emby Server ID
 media_processor_instance: Optional[MediaProcessor] = None
-background_task_status = {
-    "is_running": False,
-    "current_action": "无",
-    "progress": 0,
-    "message": "等待任务"
-}
-task_lock = threading.Lock() # 用于确保后台任务串行执行
-APP_CONFIG: Dict[str, Any] = {} # ✨✨✨ 新增：全局配置字典 ✨✨✨
+actor_subscription_processor_instance: Optional[ActorSubscriptionProcessor] = None
 media_processor_instance: Optional[MediaProcessor] = None
 watchlist_processor_instance: Optional[WatchlistProcessor] = None
-
-# ✨✨✨ 任务队列 ✨✨✨
-task_queue = Queue()
-task_worker_thread: Optional[threading.Thread] = None
-task_worker_lock = threading.Lock()
 
 scheduler = BackgroundScheduler(timezone=str(pytz.timezone(constants.TIMEZONE)))
 JOB_ID_FULL_SCAN = "scheduled_full_scan"
 JOB_ID_SYNC_PERSON_MAP = "scheduled_sync_person_map"
 JOB_ID_PROCESS_WATCHLIST = "scheduled_process_watchlist"
+JOB_ID_REVIVAL_CHECK = "scheduled_revival_check"
 # --- 全局变量结束 ---
 
 # --- 数据库辅助函数 ---
@@ -215,195 +94,210 @@ def task_process_single_item(processor: MediaProcessor, item_id: str, force_repr
 # --- 初始化数据库 ---
 def init_db():
     """
-    【重建版】初始化数据库，创建面向未来的统一表结构。
-    此版本已移除旧的、分离的演员表，并引入了统一的身份管理体系。
+    【最终版】初始化数据库，创建所有表的最终结构，并包含性能优化。
     """
+    logger.info("正在初始化数据库，创建/验证所有表的最终结构...")
     conn: Optional[sqlite3.Connection] = None
     try:
-        # --- 1. 准备工作：创建目录并获取连接 ---
-        if not os.path.exists(PERSISTENT_DATA_PATH):
-            os.makedirs(PERSISTENT_DATA_PATH, exist_ok=True)
-            logger.info(f"持久化数据目录已创建: {PERSISTENT_DATA_PATH}")
+        # 确保数据目录存在
+        if not os.path.exists(config_manager.PERSISTENT_DATA_PATH):
+            os.makedirs(config_manager.PERSISTENT_DATA_PATH, exist_ok=True)
 
-        conn = get_central_db_connection(DB_PATH)
-        cursor = conn.cursor()
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
+            cursor = conn.cursor()
 
-        # --- 2. 性能优化：启用 WAL 模式 ---
-        # 提高并发读写性能，是现代 SQLite 应用的标配。
-        try:
-            cursor.execute("PRAGMA journal_mode=WAL;")
-            result = cursor.fetchone()
-            if result and result[0].lower() == 'wal':
-                logger.trace("数据库已成功启用 WAL (Write-Ahead Logging) 模式。")
-            else:
-                logger.warning(f"尝试启用 WAL 模式失败，当前模式: {result[0] if result else '未知'}。")
-        except Exception as e_wal:
-            logger.error(f"启用 WAL 模式时出错: {e_wal}")
+            # --- 1. ★★★ 性能优化：启用 WAL 模式  ★★★ ---
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                result = cursor.fetchone()
+                if result and result[0].lower() == 'wal':
+                    logger.trace("  -> 数据库已成功启用 WAL (Write-Ahead Logging) 模式。")
+                else:
+                    logger.warning(f"  -> 尝试启用 WAL 模式失败，当前模式: {result[0] if result else '未知'}。")
+            except Exception as e_wal:
+                logger.error(f"  -> 启用 WAL 模式时出错: {e_wal}")
 
-        # --- 3. 创建基础表 (日志、缓存、用户) ---
-        logger.trace("正在确认/创建基础表...")
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processed_log (
-                item_id TEXT PRIMARY KEY, item_name TEXT,
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, score REAL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS failed_log (
-                item_id TEXT PRIMARY KEY, item_name TEXT,reason TEXT,
-                failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                error_message TEXT, item_type TEXT, score REAL
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS translation_cache (
-                original_text TEXT PRIMARY KEY, translated_text TEXT,
-                engine_used TEXT, last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        logger.trace("基础表结构已确认。")
+            # --- 2. 创建基础表 (日志、缓存、用户) ---
+            logger.trace("  -> 正在创建基础表...")
+            cursor.execute("CREATE TABLE IF NOT EXISTS processed_log (item_id TEXT PRIMARY KEY, item_name TEXT, processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, score REAL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS failed_log (item_id TEXT PRIMARY KEY, item_name TEXT, reason TEXT, failed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, error_message TEXT, item_type TEXT, score REAL)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            cursor.execute("CREATE TABLE IF NOT EXISTS translation_cache (original_text TEXT PRIMARY KEY, translated_text TEXT, engine_used TEXT, last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            # --- 3. 创建核心功能表 ---
+            # 电影合集检查
+            logger.trace("  -> 正在创建 'collections_info' 表...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS collections_info (
+                    emby_collection_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    tmdb_collection_id TEXT,
+                    status TEXT,
+                    has_missing BOOLEAN, 
+                    missing_movies_json TEXT,
+                    last_checked_at TIMESTAMP,
+                    poster_path TEXT,
+                    in_library_count INTEGER DEFAULT 0 
+                )
+            """)
 
-        # --- 4. 创建核心功能表 (追剧列表) ---
-        logger.trace("正在确认/创建 'watchlist' 表...")
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS watchlist (
-                item_id TEXT PRIMARY KEY,
-                tmdb_id TEXT NOT NULL,
-                item_name TEXT,
-                item_type TEXT DEFAULT 'Series',
-                status TEXT DEFAULT 'Watching', -- 'Watching', 'Paused', 'Completed'
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_checked_at TIMESTAMP
-            )
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_status ON watchlist (status)")
-        logger.trace("表 'watchlist' 结构已确认。")
+            # ✨ 为老用户平滑升级数据库结构的逻辑
+            try:
+                cursor.execute("PRAGMA table_info(collections_info)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'in_library_count' not in columns:
+                    logger.info("    -> 检测到旧版 'collections_info' 表，正在添加 'in_library_count' 字段...")
+                    cursor.execute("ALTER TABLE collections_info ADD COLUMN in_library_count INTEGER DEFAULT 0;")
+                    logger.info("    -> 'in_library_count' 字段添加成功。")
+            except Exception as e_alter:
+                logger.error(f"  -> 为 'collections_info' 表添加新字段时出错: {e_alter}")
 
+            # 剧集追踪 (追剧列表) 
+            logger.trace("  -> 正在创建/更新 'watchlist' 表...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS watchlist (
+                    item_id TEXT PRIMARY KEY,
+                    tmdb_id TEXT NOT NULL,
+                    item_name TEXT,
+                    item_type TEXT DEFAULT 'Series',
+                    status TEXT DEFAULT 'Watching',
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked_at TIMESTAMP,
+                    tmdb_status TEXT,
+                    next_episode_to_air_json TEXT,
+                    missing_info_json TEXT,
+                    paused_until DATE DEFAULT NULL 
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_status ON watchlist (status)")
 
-        # 核心表：person_identity_map (单一事实来源)
-        # 职责：存储每个演员的唯一身份和跨平台ID映射。
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS person_identity_map (
-                -- 中立的内部主键，我们的地盘我们做主！
-                map_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                
-                -- 权威的、用户友好的名字
-                primary_name TEXT NOT NULL,
-                -- (可选) 使用JSON存储其他平台的名字，如 {"tmdb": "Yan Ni", "douban": "闫妮"}
+            # ★★★ 新增：为现有数据库平滑升级的逻辑 ★★★
+            # 这种方式可以确保老用户更新程序后，数据库结构也能自动更新而不会报错。
+            try:
+                cursor.execute("PRAGMA table_info(watchlist)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'paused_until' not in columns:
+                    logger.info("    -> 检测到旧版 'watchlist' 表，正在添加 'paused_until' 字段...")
+                    cursor.execute("ALTER TABLE watchlist ADD COLUMN paused_until DATE DEFAULT NULL;")
+                    logger.info("    -> 'paused_until' 字段添加成功。")
+            except Exception as e_alter:
+                logger.error(f"  -> 为 'watchlist' 表添加新字段时出错: {e_alter}")
 
-                -- 所有外部ID，都应该是 UNIQUE 且允许为 NULL
-                emby_person_id TEXT UNIQUE,
-                tmdb_person_id INTEGER UNIQUE,
-                imdb_id TEXT UNIQUE,
-                douban_celebrity_id TEXT UNIQUE,
+            # 演员身份映射
+            logger.trace("  -> 正在创建 'person_identity_map' 表...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS person_identity_map (
+                    map_id INTEGER PRIMARY KEY AUTOINCREMENT, primary_name TEXT NOT NULL, emby_person_id TEXT UNIQUE,
+                    tmdb_person_id INTEGER UNIQUE, imdb_id TEXT UNIQUE, douban_celebrity_id TEXT UNIQUE,
+                    last_synced_at TIMESTAMP, last_updated_at TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_emby_id ON person_identity_map (emby_person_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_tmdb_id ON person_identity_map (tmdb_person_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_imdb_id ON person_identity_map (imdb_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_douban_id ON person_identity_map (douban_celebrity_id)")
 
-                -- 时间戳
-                last_synced_at TIMESTAMP,
-                last_updated_at TIMESTAMP
-            )
-        """)
-        # 为所有外部ID创建索引，加速查找和冲突检测
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_emby_id ON person_identity_map (emby_person_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_tmdb_id ON person_identity_map (tmdb_person_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_imdb_id ON person_identity_map (imdb_id)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pim_douban_id ON person_identity_map (douban_celebrity_id)")
-        logger.trace("  -> [核心] 'person_identity_map' 表已创建。")
+            # 演员元数据缓存
+            logger.trace("  -> 正在创建 'ActorMetadata' 表...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS ActorMetadata (
+                    tmdb_id INTEGER PRIMARY KEY, profile_path TEXT, gender INTEGER, adult BOOLEAN,
+                    popularity REAL, original_name TEXT, last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(tmdb_id) REFERENCES person_identity_map(tmdb_person_id) ON DELETE CASCADE
+                )
+            """)
 
-        # =================================================================
-        # ★★★ 5.2 新增核心表：ActorMetadata (TMDb元数据缓存) ★★★
-        # =================================================================
-        # 职责：专门存储从TMDb获取的、用于增强显示的演员元数据。
-        logger.trace("正在确认/创建 'ActorMetadata' 表...")
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ActorMetadata (
-                -- 主键，并与 person_identity_map 表建立外键关系
-                tmdb_id INTEGER PRIMARY KEY,
-                
-                -- 需要缓存的核心元数据字段
-                profile_path TEXT,
-                gender INTEGER,
-                adult BOOLEAN,
-                popularity REAL,
-                original_name TEXT,
-                
-                -- 时间戳，方便管理缓存刷新
-                last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                
-                -- 外键约束：确保这里的演员在身份映射表中存在
-                -- ON DELETE CASCADE: 如果身份映射记录被删除，这里的元数据也自动删除
-                FOREIGN KEY(tmdb_id) REFERENCES person_identity_map(tmdb_person_id) ON DELETE CASCADE
-            )
-        """)
-        logger.trace("  -> [核心] 'ActorMetadata' 表已确认。")
+            # 演员订阅功能表
+            logger.trace("  -> 正在创建 'actor_subscriptions' 表 (演员订阅)...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS actor_subscriptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tmdb_person_id INTEGER NOT NULL UNIQUE,      -- 演员在TMDb的唯一ID，这是关联的核心
+                    actor_name TEXT NOT NULL,                    -- 演员名字 (用于UI显示)
+                    profile_path TEXT,                           -- 演员头像路径 (用于UI显示)
 
-        # --- 6. 提交事务 ---
-        conn.commit()
-        logger.trace(f"数据库重建完成！所有表结构已在 '{DB_PATH}' 中创建。")
+                    -- 订阅配置 --
+                    config_start_year INTEGER DEFAULT 1900,      -- 起始年份筛选
+                    config_media_types TEXT DEFAULT 'Movie,TV',  -- 订阅的媒体类型 (逗号分隔, e.g., "Movie,TV")
+                    config_genres_include_json TEXT,             -- 包含的类型ID (JSON数组, e.g., "[28, 12]")
+                    config_genres_exclude_json TEXT,             -- 排除的类型ID (JSON数组, e.g., "[99]")
+                    config_min_rating REAL DEFAULT 6.0,          -- 最低评分筛选，0表示不筛选
+
+                    -- 状态与维护 --
+                    status TEXT DEFAULT 'active',                -- 订阅状态 ('active', 'paused')
+                    last_checked_at TIMESTAMP,                   -- 上次计划任务检查的时间
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- 添加订阅的时间
+                )
+            """)
+            # ★★★ 新增：为老用户平滑升级数据库结构 ★★★
+            try:
+                cursor.execute("PRAGMA table_info(actor_subscriptions)")
+                columns = [row[1] for row in cursor.fetchall()]
+                if 'config_min_rating' not in columns:
+                    logger.info("    -> 检测到旧版 'actor_subscriptions' 表，正在添加 'config_min_rating' 字段...")
+                    cursor.execute("ALTER TABLE actor_subscriptions ADD COLUMN config_min_rating REAL DEFAULT 6.0;")
+                    logger.info("    -> 'config_min_rating' 字段添加成功。")
+            except Exception as e_alter:
+                logger.error(f"  -> 为 'actor_subscriptions' 表添加新字段时出错: {e_alter}")
+            # ★★★ 升级逻辑结束 ★★★
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_as_tmdb_person_id ON actor_subscriptions (tmdb_person_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_as_status ON actor_subscriptions (status)")
+
+            logger.trace("  -> 正在创建 'tracked_actor_media' 表 (追踪的演员媒体)...")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS tracked_actor_media (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subscription_id INTEGER NOT NULL,            -- 外键，关联到 actor_subscriptions.id
+                    tmdb_media_id INTEGER NOT NULL,              -- 影视项目在TMDb的ID (电影或剧集)
+                    media_type TEXT NOT NULL,                    -- 'Movie' 或 'Series'
+
+                    -- 用于UI显示和筛选的基本信息 --
+                    title TEXT NOT NULL,
+                    release_date TEXT,
+                    poster_path TEXT,
+
+                    -- 核心状态字段 --
+                    status TEXT NOT NULL,                        -- 'IN_LIBRARY', 'PENDING_RELEASE', 'SUBSCRIBED', 'MISSING'
+                    emby_item_id TEXT,                           -- 如果已入库，其在Emby中的ID
+                    last_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                    FOREIGN KEY(subscription_id) REFERENCES actor_subscriptions(id) ON DELETE CASCADE,
+                    UNIQUE(subscription_id, tmdb_media_id) -- 确保每个订阅下，一个媒体项只被追踪一次
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tam_subscription_id ON tracked_actor_media (subscription_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tam_status ON tracked_actor_media (status)")
+
+            conn.commit()
+            logger.info("数据库初始化完成，所有表结构已更新至最新版本。")
 
     except sqlite3.Error as e_sqlite:
         logger.error(f"数据库初始化时发生 SQLite 错误: {e_sqlite}", exc_info=True)
         if conn:
             try: conn.rollback()
             except Exception as e_rb: logger.error(f"SQLite 错误后回滚失败: {e_rb}")
+        raise # 重新抛出异常，让程序停止
     except Exception as e_global:
         logger.error(f"数据库初始化时发生未知错误: {e_global}", exc_info=True)
         if conn:
             try: conn.rollback()
             except Exception as e_rb: logger.error(f"未知错误后回滚失败: {e_rb}")
-    finally:
-        if conn:
-            conn.close()
-            logger.trace("数据库连接已在 init_db 的 finally 块中安全关闭。")
-# ✨✨✨ 装饰器：检查登陆状态 ✨✨✨
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # ★★★ 核心修复：正确地解包 load_config 返回的元组 ★★★
-        if not APP_CONFIG.get(constants.CONFIG_OPTION_AUTH_ENABLED, False) or 'user_id' in session:
-            return f(*args, **kwargs)
-        
-        return jsonify({"error": "未授权，请先登录"}), 401
-    return decorated_function
-# ✨✨✨ 装饰器：检查后台任务锁是否被占用 ✨✨✨
-def task_lock_required(f):
-    """装饰器：检查后台任务锁是否被占用。"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if task_lock.locked():
-            return jsonify({"error": "后台有任务正在运行，请稍后再试。"}), 409
-        return f(*args, **kwargs)
-    return decorated_function
-# ✨✨✨ 装饰器：检查核心处理器是否已初始化 ✨✨✨
-def processor_ready_required(f):
-    """装饰器：检查核心处理器是否已初始化。"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not media_processor_instance:
-            return jsonify({"error": "核心处理器未就绪。"}), 503
-        return f(*args, **kwargs)
-    return decorated_function
+        raise # 重新抛出异常，让程序停止
 # --- 初始化认证系统 ---
 def init_auth():
     """
     【V2 - 使用全局配置版】初始化认证系统。
     """
-    # ✨✨✨ 核心修复：不再自己调用 load_config，而是依赖已加载的 APP_CONFIG ✨✨✨
+    # ✨✨✨ 核心修复：不再自己调用 load_config，而是依赖已加载的 config_manager.APP_CONFIG ✨✨✨
     # load_config() 应该在主程序入口处被调用一次
     
-    auth_enabled = APP_CONFIG.get(constants.CONFIG_OPTION_AUTH_ENABLED, False)
+    auth_enabled = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_AUTH_ENABLED, False)
     env_username = os.environ.get("AUTH_USERNAME")
     
     if env_username:
         username = env_username.strip()
         logger.debug(f"检测到 AUTH_USERNAME 环境变量，将使用用户名: '{username}'")
     else:
-        username = APP_CONFIG.get(constants.CONFIG_OPTION_AUTH_USERNAME, constants.DEFAULT_USERNAME).strip()
+        username = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_AUTH_USERNAME, constants.DEFAULT_USERNAME).strip()
         logger.debug(f"未检测到 AUTH_USERNAME 环境变量，将使用配置文件中的用户名: '{username}'")
 
     if not auth_enabled:
@@ -413,7 +307,7 @@ def init_auth():
     # ... 函数的其余部分保持不变 ...
     conn = None
     try:
-        conn = get_central_db_connection(DB_PATH)
+        conn = get_central_db_connection(config_manager.DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -434,7 +328,7 @@ def init_auth():
             logger.critical(f"首次运行，已为用户 '{username}' 自动生成初始密码。")
             logger.critical(f"用户名: {username}")
             logger.critical(f"初始密码: {random_password}")
-            logger.critical("请立即使用此密码登录，并在设置页面修改为您自己的密码。")
+            logger.critical("请立即使用此密码登录，并在设置页面修改为你自己的密码。")
             logger.critical("=" * 60)
         else:
             logger.trace(f"[AUTH DIAGNOSTIC] User '{username}' found in DB. No action needed.")
@@ -445,77 +339,17 @@ def init_auth():
         if conn:
             conn.close()
         logger.info("="*21 + " [基础配置加载完毕] " + "="*21)
-# --- 加载配置 ---
-def load_config() -> Tuple[Dict[str, Any], bool]:
-    """【清单驱动版】从 config.ini 加载配置。"""
-    global APP_CONFIG
-    config_parser = configparser.ConfigParser()
-    is_first_run = not os.path.exists(CONFIG_FILE_PATH)
-
-    if not is_first_run:
-        try:
-            config_parser.read(CONFIG_FILE_PATH, encoding='utf-8')
-        except Exception as e:
-            logger.error(f"解析配置文件时出错: {e}", exc_info=True)
-
-    app_cfg = {}
-    
-    # 遍历配置清单，自动加载所有配置项
-    for key, (section, type, default) in CONFIG_DEFINITION.items():
-        if not config_parser.has_section(section):
-            config_parser.add_section(section)
-            
-        if type == 'boolean':
-            # 特殊处理首次运行时的认证开关
-            if key == constants.CONFIG_OPTION_AUTH_ENABLED and is_first_run:
-                app_cfg[key] = True
-            else:
-                app_cfg[key] = config_parser.getboolean(section, key, fallback=default)
-        elif type == 'int':
-            app_cfg[key] = config_parser.getint(section, key, fallback=default)
-        elif type == 'float':
-            app_cfg[key] = config_parser.getfloat(section, key, fallback=default)
-        elif type == 'list':
-            value_str = config_parser.get(section, key, fallback=",".join(map(str, default)))
-            app_cfg[key] = [item.strip() for item in value_str.split(',') if item.strip()]
-        else: # string
-            app_cfg[key] = config_parser.get(section, key, fallback=default)
-
-    APP_CONFIG = app_cfg.copy()
-    logger.trace("全局配置 APP_CONFIG 已更新。")
-    return app_cfg, is_first_run
-# --- 保存配置 ---
-def save_config(new_config: Dict[str, Any]):
-    """【清单驱动版】将配置保存到 config.ini。"""
-    global APP_CONFIG
-    config_parser = configparser.ConfigParser()
-    
-    # 遍历配置清单，自动设置所有配置项
-    for key, (section, type, _) in CONFIG_DEFINITION.items():
-        if not config_parser.has_section(section):
-            config_parser.add_section(section)
-        
-        value = new_config.get(key)
-        
-        # 将值转换为适合写入ini文件的字符串格式
-        if isinstance(value, bool):
-            value_to_write = str(value).lower()
-        elif isinstance(value, list):
-            value_to_write = ",".join(map(str, value))
-        else:
-            value_to_write = str(value)
-        value_to_write = value_to_write.replace('%', '%%')
-        config_parser.set(section, key, value_to_write)
-
+# --- 保存配置并重新加载的函数 ---
+def save_config_and_reload(new_config: Dict[str, Any]):
+    """
+    调用配置管理器保存配置，并在此处执行所有必要的重新初始化操作。
+    """
     try:
-        # ... (写入文件和重新初始化的逻辑保持不变) ...
-        with open(CONFIG_FILE_PATH, 'w', encoding='utf-8') as configfile:
-            config_parser.write(configfile)
+        # 步骤 1: 调用 config_manager 来保存文件和更新内存中的 config_manager.APP_CONFIG
+        config_manager.save_config(new_config)
         
-        APP_CONFIG = new_config.copy()
-        logger.info(f"配置已成功写入到 {CONFIG_FILE_PATH}。")
-        
-        # 重新初始化相关服务
+        # 步骤 2: 执行所有依赖于新配置的重新初始化逻辑
+        # 这是从旧的 save_config 函数中移动过来的，现在的位置更合理
         initialize_processors()
         init_auth()
         setup_scheduled_tasks()
@@ -523,197 +357,88 @@ def save_config(new_config: Dict[str, Any]):
         
     except Exception as e:
         logger.error(f"保存配置文件或重新初始化时失败: {e}", exc_info=True)
+        # 向上抛出异常，让 API 端点可以捕获它并返回错误信息
+        raise
 # --- 始化所有需要的处理器实例 ---
 def initialize_processors():
-    """
-    【修复版】初始化所有需要的处理器实例，包括 MediaProcessor 和 WatchlistProcessor。
-    """
-    # ★★★ 1. 声明所有需要修改的全局变量 ★★★
-    global media_processor_instance, watchlist_processor_instance
-    
-    if not APP_CONFIG:
+    """初始化所有处理器，并将实例赋值给 extensions 模块中的全局变量。"""
+    # 这个函数不再需要 global 声明，因为它只修改其他模块的变量
+    global media_processor_instance, watchlist_processor_instance, actor_subscription_processor_instance, EMBY_SERVER_ID
+    if not config_manager.APP_CONFIG:
         logger.error("无法初始化处理器：全局配置 APP_CONFIG 为空。")
         return
 
-    current_config = APP_CONFIG.copy()
-    current_config['db_path'] = DB_PATH
+    current_config = config_manager.APP_CONFIG.copy()
+    current_config['db_path'] = config_manager.DB_PATH
 
-    # --- 初始化 MediaProcessor  ---
-    if media_processor_instance:
-        media_processor_instance.close()
+    # --- 1. 创建实例并存储在局部变量中 ---
+    
+    # 初始化 server_id_local
+    server_id_local = None
+    emby_url = current_config.get("emby_server_url")
+    emby_key = current_config.get("emby_api_key")
+    if emby_url and emby_key:
+        server_info = emby_handler.get_emby_server_info(emby_url, emby_key)
+        if server_info and server_info.get("Id"):
+            server_id_local = server_info.get("Id")
+            logger.trace(f"成功获取到 Emby Server ID: {server_id_local}")
+        else:
+            logger.warning("未能获取到 Emby Server ID，跳转链接可能不完整。")
+
+    # 初始化 media_processor_instance_local
     try:
-        media_processor_instance = MediaProcessor(config=current_config)
+        media_processor_instance_local = MediaProcessor(config=current_config)
         logger.info("核心处理器 实例已创建/更新。")
     except Exception as e:
         logger.error(f"创建 MediaProcessor 实例失败: {e}", exc_info=True)
-        media_processor_instance = None
+        media_processor_instance_local = None
 
-    # --- ★★★ 2. 新增：初始化 WatchlistProcessor ★★★ ---
-    if watchlist_processor_instance:
-        try:
-            watchlist_processor_instance.close()
-        except Exception as e:
-            logger.warning(f"关闭旧的 watchlist_processor_instance 时出错: {e}")
+    # 初始化 watchlist_processor_instance_local
+    try:
+        watchlist_processor_instance_local = WatchlistProcessor(config=current_config)
+        logger.trace("WatchlistProcessor 实例已成功初始化。")
+    except Exception as e:
+        logger.error(f"创建 WatchlistProcessor 实例失败: {e}", exc_info=True)
+        watchlist_processor_instance_local = None
 
-    # 追剧功能通常依赖于核心配置，我们在这里创建它，让它随时待命
-    # 假设 WatchlistProcessor 也需要 Emby URL 和 API Key
-    if current_config.get("emby_server_url") and current_config.get("emby_api_key"):
-        try:
-            # 假设 WatchlistProcessor 的构造函数和 MediaProcessor 类似，接收一个 config 字典
-            watchlist_processor_instance = WatchlistProcessor(config=current_config)
-            logger.trace("WatchlistProcessor 实例已成功初始化，随时待命。")
-        except Exception as e:
-            logger.error(f"创建 WatchlistProcessor 实例失败: {e}", exc_info=True)
-            watchlist_processor_instance = None # 初始化失败，明确设为 None
-    else:
-        logger.warning("WatchlistProcessor 未初始化，因为缺少必要的 Emby 配置。")
-        watchlist_processor_instance = None
+    # 初始化 actor_subscription_processor_instance_local
+    try:
+        actor_subscription_processor_instance_local = ActorSubscriptionProcessor(config=current_config)
+        logger.trace("ActorSubscriptionProcessor 实例已成功初始化。")
+    except Exception as e:
+        logger.error(f"创建 ActorSubscriptionProcessor 实例失败: {e}", exc_info=True)
+        actor_subscription_processor_instance_local = None
+
+
+    # 首先，赋值给 web_app.py 自己的全局变量
+    media_processor_instance = media_processor_instance_local
+    watchlist_processor_instance = watchlist_processor_instance_local
+    actor_subscription_processor_instance = actor_subscription_processor_instance_local
+    EMBY_SERVER_ID = server_id_local
+    
+    # 然后，将同样的值赋给 extensions 模块的全局变量，供蓝图使用
+    extensions.media_processor_instance = media_processor_instance
+    extensions.watchlist_processor_instance = watchlist_processor_instance
+    extensions.actor_subscription_processor_instance = actor_subscription_processor_instance
+    extensions.EMBY_SERVER_ID = EMBY_SERVER_ID
+    
+    # --- 3. 将 extensions 中的变量注入到任务管理器 ---
+    task_manager.initialize_task_manager(
+        media_proc=extensions.media_processor_instance,
+        watchlist_proc=extensions.watchlist_processor_instance,
+        actor_sub_proc=extensions.actor_subscription_processor_instance,
+        status_callback=update_status_from_thread
+    )
 # --- 后台任务回调 ---
 def update_status_from_thread(progress: int, message: str):
-    global background_task_status
-    if progress >= 0:
-        background_task_status["progress"] = progress
-    background_task_status["message"] = message
-# --- 后台任务封装 ---
-def _execute_task_with_lock(task_function, task_name: str, processor: Union[MediaProcessor, WatchlistProcessor], *args, **kwargs):
     """
-    【V2 - 工人专用版】通用后台任务执行器。
-    第一个参数必须是 MediaProcessor 实例。
+    这个回调函数由处理器调用，用于更新任务状态。
+    它通过 task_manager 模块来修改状态字典。
     """
-    global background_task_status
-    # 锁的检查可以移到提交任务的地方，或者保留作为双重保险
-    # if task_lock.locked(): ...
-
-    with task_lock:
-        # 1. 检查传入的处理器是否有效
-        if not processor:
-            logger.error(f"任务 '{task_name}' 无法启动：对应的处理器未初始化。")
-            # 可以在这里更新状态，但因为没有启动，所以只打日志可能更清晰
-            return
-
-        # 2. 清理当前任务处理器的停止信号
-        processor.clear_stop_signal()
-
-        # 3. 设置任务状态，准备执行
-        background_task_status["is_running"] = True
-        background_task_status["current_action"] = task_name
-        background_task_status["progress"] = 0
-        background_task_status["message"] = f"{task_name} 初始化..."
-        logger.info(f"后台任务 '{task_name}' 开始执行。")
-
-        task_completed_normally = False
-        try:
-            if processor.is_stop_requested():
-                raise InterruptedError("任务被取消")
-
-            # 执行核心任务
-            task_function(processor, *args, **kwargs)
-            
-            # ★★★ 核心修复：如果任务能顺利执行到这里，说明它正常完成了 ★★★
-            # 我们只在没有被用户中止的情况下，才标记为正常完成
-            if not processor.is_stop_requested():
-                task_completed_normally = True
-        finally:
-            final_message_for_status = "未知结束状态"
-            current_progress = background_task_status["progress"] # 获取当前进度
-
-            if processor and processor.is_stop_requested():
-                final_message_for_status = "任务已成功中断。"
-            elif task_completed_normally:
-                final_message_for_status = "处理完成。"
-                current_progress = 100 # 正常完成则进度100%
-            # else: 异常退出时，消息已在except中通过update_status_from_thread设置
-
-            update_status_from_thread(current_progress, final_message_for_status)
-            logger.info(f"后台任务 '{task_name}' 结束，最终状态: {final_message_for_status}")
-
-            if processor:
-                processor.close()
-                try:
-                    media_processor_instance.close()
-                except Exception as e_close_proc:
-                    logger.error(f"调用 media_processor_instance.close() 时发生错误: {e_close_proc}", exc_info=True)
-
-            time.sleep(1)
-        background_task_status["is_running"] = False
-        background_task_status["current_action"] = "无"
-        background_task_status["progress"] = 0
-        background_task_status["message"] = "等待任务"
-        if processor:
-            processor.clear_stop_signal()
-        logger.debug(f"后台任务 '{task_name}' 状态已重置。")
-# --- 通用队列 ---
-def task_worker_function():
-    """
-    通用工人线程，从队列中获取并处理各种后台任务。
-    """
-    logger.info("通用任务线程已启动，等待任务...")
-    while True:
-        try:
-            # 从队列中获取任务元组
-            task_info = task_queue.get()
-
-            if task_info is None: # 停止信号
-                logger.info("工人线程收到停止信号，即将退出。")
-                break
-
-            # 解包任务信息
-            task_function, task_name, args, kwargs = task_info
-            # ★★★ 核心修复：在任务执行前，检查全局实例是否可用 ★★★
-            if "追剧" in task_name or "watchlist" in task_function.__name__:
-                processor_to_use = watchlist_processor_instance
-                logger.debug(f"任务 '{task_name}' 将使用 WatchlistProcessor。")
-            else:
-                processor_to_use = media_processor_instance
-                logger.debug(f"任务 '{task_name}' 将使用 MediaProcessor。")
-
-            if not processor_to_use:
-                logger.error(f"任务 '{task_name}' 无法执行：对应的处理器未初始化。")
-                task_queue.task_done()
-                continue
-
-            _execute_task_with_lock(task_function, task_name, processor_to_use, *args, **kwargs)
-            
-            task_queue.task_done()
-        except Exception as e:
-            logger.error(f"通用工人线程发生未知错误: {e}", exc_info=True)
-            time.sleep(5)
-# --- 安全地启动通用工人线程 ---
-def start_task_worker_if_not_running():
-    """
-    安全地启动通用工人线程。
-    """
-    global task_worker_thread
-    with task_worker_lock:
-        if task_worker_thread is None or not task_worker_thread.is_alive():
-            logger.trace("通用任务线程未运行，正在启动...")
-            task_worker_thread = threading.Thread(target=task_worker_function, daemon=True)
-            task_worker_thread.start()
-        else:
-            logger.debug("通用任务线程已在运行。")
-# --- 为通用队列添加任务 ---
-def submit_task_to_queue(task_function, task_name: str, *args, **kwargs):
-    """
-    【修复版】将一个任务提交到通用队列中，并在这里清空日志。
-    """
-    # ★★★ 核心修改：在提交任务到队列之前，就清空旧日志 ★★★
-    # 这个操作应该在 task_lock 的保护下进行，以确保原子性
-    with task_lock:
-        # 检查是否可以启动新任务
-        if background_task_status["is_running"]:
-            # 这里可以抛出异常或返回一个状态，让调用方知道任务提交失败
-            # 为了简单起见，我们先打印日志并直接返回
-            logger.warning(f"任务 '{task_name}' 提交失败：已有任务正在运行。")
-            # 或者 raise RuntimeError("已有任务在运行")
-            return
-
-        # 如果可以启动，我们就在这里清空日志
-        frontend_log_queue.clear()
-        logger.info(f"任务 '{task_name}' 已提交到队列，并已清空前端日志。")
-        
-        task_info = (task_function, task_name, args, kwargs)
-        task_queue.put(task_info)
-        start_task_worker_if_not_running()
+    # 确保我们访问的是 task_manager 模块中的状态字典
+    if task_manager.background_task_status:
+        task_manager.background_task_status["progress"] = progress
+        task_manager.background_task_status["message"] = message
 # --- 将 CRON 表达式转换为人类可读的、干净的执行计划字符串 ---
 def _get_next_run_time_str(cron_expression: str) -> str:
     """
@@ -777,186 +502,161 @@ def _get_next_run_time_str(cron_expression: str) -> str:
             return f"按计划 '{cron_expression}' 执行"
 # --- 定时任务配置 ---
 def setup_scheduled_tasks():
-    config = APP_CONFIG
-    # --- 处理全量扫描的定时任务 ---
-    schedule_scan_enabled = config.get("schedule_enabled", False)
-    scan_cron_expression = config.get("schedule_cron", "0 3 * * *")
-    force_reprocess_scheduled_scan = config.get("schedule_force_reprocess", False)
-
-    if scheduler.get_job(JOB_ID_FULL_SCAN):
-        scheduler.remove_job(JOB_ID_FULL_SCAN)
-        # logger.info("已移除旧的定时全量扫描任务。") # 可以选择性保留或移除此日志
-
-    if schedule_scan_enabled:
+    """
+    【最终版】根据全局配置，设置或移除所有定时任务。
+    """
+    config = config_manager.APP_CONFIG
+    
+    # --- 任务 1: 全量扫描 ---
+    JOB_ID_FULL_SCAN = "scheduled_full_scan"
+    if scheduler.get_job(JOB_ID_FULL_SCAN): scheduler.remove_job(JOB_ID_FULL_SCAN)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_ENABLED, False):
         try:
-            def submit_scheduled_scan_to_queue():
-                # ... (内部逻辑保持不变)
-                logger.info(f"定时任务触发：准备提交全量扫描到任务队列 (强制={force_reprocess_scheduled_scan})。")
-                if force_reprocess_scheduled_scan:
-                    logger.info("定时任务：检测到“强制重处理”选项，将在任务开始前清空已处理日志。")
-                    if media_processor_instance:
-                        media_processor_instance.clear_processed_log()
-                    else:
-                        logger.error("定时任务：无法清空日志，因为处理器未初始化。")
-                current_config = APP_CONFIG
-                process_episodes = current_config.get('process_episodes', True)
-                submit_task_to_queue(
-                    task_process_full_library,
-                    "定时全量扫描",
-                    process_episodes=process_episodes
-                )
-
-            scheduler.add_job(
-                func=submit_scheduled_scan_to_queue,
-                trigger=CronTrigger.from_crontab(scan_cron_expression, timezone=str(pytz.timezone(constants.TIMEZONE))),
-                id=JOB_ID_FULL_SCAN,
-                name="定时全量媒体库扫描",
-                replace_existing=True,
-            )
-            # ✨ 日志优化 ✨
-            next_run_str = _get_next_run_time_str(scan_cron_expression)
-            force_str = " (强制重处理)" if force_reprocess_scheduled_scan else ""
-            logger.info(f"已设置定时任务：全量扫描，将{next_run_str}{force_str}")
-
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_CRON)
+            force = config.get(constants.CONFIG_OPTION_SCHEDULE_FORCE_REPROCESS, False)
+            
+            def scheduled_scan_task():
+                logger.info(f"定时任务触发：全量扫描 (强制={force})。")
+                if force: media_processor_instance.clear_processed_log()
+                task_manager.submit_task_to_queue(task_process_full_library, "定时全量扫描", process_episodes=config_manager.APP_CONFIG.get('process_episodes', True))
+            
+            scheduler.add_job(func=scheduled_scan_task, trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_FULL_SCAN, name="定时全量扫描", replace_existing=True)
+            logger.info(f"已设置定时任务：全量扫描，将{_get_next_run_time_str(cron)}{' (强制重处理)' if force else ''}")
         except Exception as e:
             logger.error(f"设置定时全量扫描任务失败: {e}", exc_info=True)
     else:
         logger.info("定时全量扫描任务未启用。")
 
-    # --- 对同步映射表的定时任务也做类似修改 ---
-    schedule_sync_map_enabled = config.get("schedule_sync_map_enabled", False)
-    sync_map_cron_expression = config.get("schedule_sync_map_cron", "0 1 * * *")
-
-    if scheduler.get_job(JOB_ID_SYNC_PERSON_MAP):
-        scheduler.remove_job(JOB_ID_SYNC_PERSON_MAP)
-
-    if schedule_sync_map_enabled:
+    # --- 任务 2: 同步演员映射表 ---
+    JOB_ID_SYNC_PERSON_MAP = "scheduled_sync_person_map"
+    if scheduler.get_job(JOB_ID_SYNC_PERSON_MAP): scheduler.remove_job(JOB_ID_SYNC_PERSON_MAP)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_SYNC_MAP_ENABLED, False):
         try:
-            def scheduled_sync_map_task():
-                # ... (内部逻辑保持不变)
-                logger.info("定时任务触发：演员映射表同步。")
-                submit_task_to_queue(
-                    task_sync_person_map,
-                    "定时同步演员映射表"
-                )
-
-            scheduler.add_job(
-                func=scheduled_sync_map_task,
-                trigger=CronTrigger.from_crontab(sync_map_cron_expression, timezone=str(pytz.timezone(constants.TIMEZONE))),
-                id=JOB_ID_SYNC_PERSON_MAP, name="定时同步Emby演员映射表", replace_existing=True
-            )
-            # ✨ 日志优化 ✨
-            next_run_str = _get_next_run_time_str(sync_map_cron_expression)
-            logger.info(f"已设置定时任务：同步演员映射表，将{next_run_str}")
-
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_SYNC_MAP_CRON)
+            scheduler.add_job(func=lambda: task_manager.submit_task_to_queue(task_sync_person_map, "定时同步演员映射表"), trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_SYNC_PERSON_MAP, name="定时同步演员映射表", replace_existing=True)
+            logger.info(f"已设置定时任务：同步演员映射表，将{_get_next_run_time_str(cron)}")
         except Exception as e:
             logger.error(f"设置定时同步演员映射表任务失败: {e}", exc_info=True)
     else:
         logger.info("定时同步演员映射表任务未启用。")
 
-    # --- 对智能追剧任务也做类似修改 ---
-    if scheduler.get_job(JOB_ID_PROCESS_WATCHLIST):
-        scheduler.remove_job(JOB_ID_PROCESS_WATCHLIST)
+    # --- 任务 3: 刷新电影合集 ---
+    JOB_ID_REFRESH_COLLECTIONS = 'scheduled_refresh_collections'
+    if scheduler.get_job(JOB_ID_REFRESH_COLLECTIONS): scheduler.remove_job(JOB_ID_REFRESH_COLLECTIONS)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_REFRESH_COLLECTIONS_ENABLED, False):
+        try:
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_REFRESH_COLLECTIONS_CRON)
+            scheduler.add_job(func=lambda: task_manager.submit_task_to_queue(task_refresh_collections, "定时刷新电影合集"), trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_REFRESH_COLLECTIONS, name="定时刷新电影合集", replace_existing=True)
+            logger.info(f"已设置定时任务：刷新电影合集，将{_get_next_run_time_str(cron)}")
+        except Exception as e:
+            logger.error(f"设置定时刷新电影合集任务失败: {e}", exc_info=True)
+    else:
+        logger.info("定时刷新电影合集任务未启用。")
 
+    # --- 任务 4: 智能追剧刷新 ---
+    JOB_ID_PROCESS_WATCHLIST = "scheduled_process_watchlist"
+    if scheduler.get_job(JOB_ID_PROCESS_WATCHLIST): scheduler.remove_job(JOB_ID_PROCESS_WATCHLIST)
     if config.get(constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_ENABLED, False):
-            cron_expression = config.get(constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_CRON)
-            if cron_expression:
-                try:
-                    def scheduled_watchlist_task():
-                        # ... (内部逻辑保持不变)
-                        logger.debug("定时任务触发：智能追剧更新。")
-                        submit_task_to_queue(task_process_watchlist, "定时智能追剧更新")
-
-                    scheduler.add_job(
-                        func=scheduled_watchlist_task,
-                        trigger=CronTrigger.from_crontab(cron_expression, timezone=str(pytz.timezone(constants.TIMEZONE))),
-                        id=JOB_ID_PROCESS_WATCHLIST,
-                        name="定时智能追剧更新",
-                        replace_existing=True,
-                    )
-                    # ✨ 日志优化 ✨
-                    next_run_str = _get_next_run_time_str(cron_expression)
-                    logger.info(f"已设置定时任务：智能追剧更新，将{next_run_str}")
-
-                except Exception as e:
-                    logger.error(f"设置定时智能追剧更新任务失败: {e}", exc_info=True)
+        try:
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_CRON)
+            # ★★★ 核心修改：让定时任务调用新的、职责更明确的函数 ★★★
+            def scheduled_watchlist_task():
+                task_manager.submit_task_to_queue(
+                    lambda p: p.run_regular_processing_task(update_status_from_thread),
+                    "定时智能追剧更新"
+                )
+            scheduler.add_job(func=scheduled_watchlist_task, trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_PROCESS_WATCHLIST, name="定时常规追剧更新", replace_existing=True)
+            logger.info(f"已设置定时任务：智能追剧更新，将{_get_next_run_time_str(cron)}")
+        except Exception as e:
+            logger.error(f"设置定时智能追剧更新任务失败: {e}", exc_info=True)
     else:
         logger.info("定时智能追剧更新任务未启用。")
-    # ✨✨✨ 处理演员元数据增强任务 ✨✨✨
-    job_id_enrich = 'scheduled_enrich_aliases' # 给它一个唯一的ID
-    if scheduler.get_job(job_id_enrich):
-        scheduler.remove_job(job_id_enrich)
 
-    if config.get(constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_ENABLED, False):
-        cron_expression = config.get(constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_CRON)
-        if cron_expression:
-            try:
-                def scheduled_enrich_task_submitter():
-                    logger.debug("定时任务触发：准备提交演员元数据增强任务到队列。")
-                    submit_task_to_queue(
-                        task_enrich_aliases, # <--- 调用我们刚刚创建的任务函数
-                        "演员元数据增强"
-                    )
-
-                scheduler.add_job(
-                    func=scheduled_enrich_task_submitter, # 调度器调用这个提交者
-                    trigger=CronTrigger.from_crontab(cron_expression, timezone=str(pytz.timezone(constants.TIMEZONE))),
-                    id=job_id_enrich,
-                    name="定时补充演员元数据",
-                    replace_existing=True,
-                )
-                next_run_str = _get_next_run_time_str(cron_expression)
-                logger.info(f"已设置定时任务：演员元数据增强，将{next_run_str}")
-            except Exception as e:
-                logger.error(f"设置定时演员元数据增强任务失败: {e}", exc_info=True)
-    else:
-        logger.info("定时演员元数据增强任务未启用。")
-
-    # --- ✨✨✨ 演员名翻译查漏补缺任务 ✨✨✨ ---
-    JOB_ID_ACTOR_CLEANUP = 'scheduled_actor_translation_cleanup'
-
-    if scheduler.get_job(JOB_ID_ACTOR_CLEANUP):
-        scheduler.remove_job(JOB_ID_ACTOR_CLEANUP)
-
-    # 使用常量从配置中读取
-    schedule_enabled = config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_ENABLED, True)
-    cron_expression = config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_CRON, constants.DEFAULT_SCHEDULE_ACTOR_CLEANUP_CRON)
-
-    if schedule_enabled:
-        try:
-            def submit_scheduled_actor_cleanup():
-                logger.info("定时任务触发：准备提交演员名翻译查漏补缺任务到队列。")
-                submit_task_to_queue(
-                    task_actor_translation_cleanup, # 任务包装函数
-                    "定时演员名查漏补缺"
-                )
-
-            scheduler.add_job(
-                func=submit_scheduled_actor_cleanup,
-                trigger=CronTrigger.from_crontab(cron_expression, timezone=str(pytz.timezone(constants.TIMEZONE))),
-                id=JOB_ID_ACTOR_CLEANUP,
-                name="定时演员名翻译查漏补缺",
-                replace_existing=True,
+    # ★★★ 已完结剧集复活检查 (硬编码，每周一次) ★★★
+    global JOB_ID_REVIVAL_CHECK
+    if scheduler.get_job(JOB_ID_REVIVAL_CHECK): scheduler.remove_job(JOB_ID_REVIVAL_CHECK)
+    try:
+        # 硬编码为每周日的凌晨5点执行，这个时间点API调用压力小
+        revival_cron = "0 5 * * 0" 
+        def scheduled_revival_check_task():
+            task_manager.submit_task_to_queue(
+                lambda p: p.run_revival_check_task(update_status_from_thread),
+                "每周已完结剧集复活检查"
             )
-            
-            next_run_str = _get_next_run_time_str(cron_expression)
-            logger.info(f"已设置定时任务：演员名翻译查漏补缺，将{next_run_str}")
+        scheduler.add_job(func=scheduled_revival_check_task, trigger=CronTrigger.from_crontab(revival_cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_REVIVAL_CHECK, name="每周已完结剧集复活检查", replace_existing=True)
+        logger.info(f"已设置内置任务：已完结剧集复活检查，将{_get_next_run_time_str(revival_cron)}")
+    except Exception as e:
+        logger.error(f"设置内置的已完结剧集复活检查任务失败: {e}", exc_info=True)
 
+    # --- 任务 5: 演员元数据 ---
+    JOB_ID_ENRICH_ALIASES = 'scheduled_enrich_aliases'
+    if scheduler.get_job(JOB_ID_ENRICH_ALIASES): scheduler.remove_job(JOB_ID_ENRICH_ALIASES)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_ENABLED, False):
+        try:
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_CRON)
+            scheduler.add_job(func=lambda: task_manager.submit_task_to_queue(task_enrich_aliases, "定时演员元数据增强"), trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_ENRICH_ALIASES, name="定时演员元数据增强", replace_existing=True)
+            logger.info(f"已设置定时任务：演员元数据补充，将{_get_next_run_time_str(cron)}")
         except Exception as e:
-            logger.error(f"设置定时演员名查漏补缺任务失败: {e}", exc_info=True)
+            logger.error(f"设置定时演员元数据补充任务失败: {e}", exc_info=True)
     else:
-        logger.info("定时演员名翻译查漏补缺任务未启用。")
+        logger.info("定时演员元数据补充任务未启用。")
 
+    # --- 任务 6: 演员名翻译 ---
+    JOB_ID_ACTOR_CLEANUP = 'scheduled_actor_translation_cleanup'
+    if scheduler.get_job(JOB_ID_ACTOR_CLEANUP): scheduler.remove_job(JOB_ID_ACTOR_CLEANUP)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_ENABLED, True):
+        try:
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_CRON)
+            scheduler.add_job(func=lambda: task_manager.submit_task_to_queue(task_actor_translation_cleanup, "定时演员名查漏补缺"), trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_ACTOR_CLEANUP, name="定时演员名查漏补缺", replace_existing=True)
+            logger.info(f"已设置定时任务：演员名翻译，将{_get_next_run_time_str(cron)}")
+        except Exception as e:
+            logger.error(f"设置定时演员名翻译任务失败: {e}", exc_info=True)
+    else:
+        logger.info("定时演员名翻译任务未启用。")
 
-    # --- 启动调度器逻辑 ---
-    # ... (这里的逻辑也需要更新) ...
-    if not scheduler.running and (
-        config.get(constants.CONFIG_OPTION_SCHEDULE_ENABLED, False) or
-        config.get(constants.CONFIG_OPTION_SCHEDULE_SYNC_MAP_ENABLED, False) or
-        config.get(constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_ENABLED, False) or
-        config.get(constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_ENABLED, False) or
-        config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_ENABLED, True) 
-    ):
+    # --- 任务 7: 智能订阅 ---
+    JOB_ID_AUTO_SUBSCRIBE = 'scheduled_auto_subscribe'
+    if scheduler.get_job(JOB_ID_AUTO_SUBSCRIBE): scheduler.remove_job(JOB_ID_AUTO_SUBSCRIBE)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_AUTOSUB_ENABLED, False):
+        try:
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_AUTOSUB_CRON)
+            scheduler.add_job(func=lambda: task_manager.submit_task_to_queue(task_auto_subscribe, "定时智能订阅"), trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))), id=JOB_ID_AUTO_SUBSCRIBE, name="定时智能订阅", replace_existing=True)
+            logger.info(f"已设置定时任务：智能订阅，将{_get_next_run_time_str(cron)}")
+        except Exception as e:
+            logger.error(f"设置定时智能订阅任务失败: {e}", exc_info=True)
+    else:
+        logger.info("定时智能订阅任务未启用。")
+
+    # --- ★★★ 任务 8: 演员订阅扫描 ★★★ ---
+    JOB_ID_ACTOR_TRACKING = 'scheduled_actor_tracking'
+    if scheduler.get_job(JOB_ID_ACTOR_TRACKING): scheduler.remove_job(JOB_ID_ACTOR_TRACKING)
+    if config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_TRACKING_ENABLED, False):
+        try:
+            cron = config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_TRACKING_CRON)
+            scheduler.add_job(
+                func=lambda: task_manager.submit_task_to_queue(task_process_actor_subscriptions, "定时演员订阅扫描"),
+                trigger=CronTrigger.from_crontab(cron, timezone=str(pytz.timezone(constants.TIMEZONE))),
+                id=JOB_ID_ACTOR_TRACKING,
+                name="定时演员订阅扫描",
+                replace_existing=True
+            )
+            logger.info(f"已设置定时任务：演员订阅扫描，将{_get_next_run_time_str(cron)}")
+        except Exception as e:
+            logger.error(f"设置定时演员订阅扫描任务失败: {e}", exc_info=True)
+    else:
+        logger.info("定时演员订阅扫描任务未启用。")
+
+    # --- 启动调度器逻辑 (包含所有任务开关) ---
+    all_schedules_enabled = [
+        config.get(constants.CONFIG_OPTION_SCHEDULE_ENABLED, False),
+        config.get(constants.CONFIG_OPTION_SCHEDULE_SYNC_MAP_ENABLED, False),
+        config.get(constants.CONFIG_OPTION_SCHEDULE_REFRESH_COLLECTIONS_ENABLED, False),
+        config.get(constants.CONFIG_OPTION_SCHEDULE_WATCHLIST_ENABLED, False),
+        config.get(constants.CONFIG_OPTION_SCHEDULE_ENRICH_ALIASES_ENABLED, False),
+        config.get(constants.CONFIG_OPTION_SCHEDULE_ACTOR_CLEANUP_ENABLED, True),
+        config.get(constants.CONFIG_OPTION_SCHEDULE_AUTOSUB_ENABLED, False)
+    ]
+    if not scheduler.running and any(all_schedules_enabled):
         try:
             scheduler.start()
             logger.info("APScheduler 已根据任务需求启动。")
@@ -1085,7 +785,7 @@ def task_sync_person_map(processor):
         config = processor.config
         
         sync_handler = UnifiedSyncHandler(
-            db_path=DB_PATH,
+            db_path=config_manager.DB_PATH,
             emby_url=config.get("emby_server_url"),
             emby_api_key=config.get("emby_api_key"),
             emby_user_id=config.get("emby_user_id"),
@@ -1117,7 +817,7 @@ def task_enrich_aliases(processor: MediaProcessor):
         config = processor.config
         
         # 获取必要的配置项
-        db_path = DB_PATH
+        db_path = config_manager.DB_PATH
         tmdb_api_key = config.get(constants.CONFIG_OPTION_TMDB_API_KEY)
 
         if not tmdb_api_key:
@@ -1159,6 +859,38 @@ def task_manual_update(processor: MediaProcessor, item_id: str, manual_cast_list
         manual_cast_list=manual_cast_list,
         item_name=item_name
     )
+# --- 扫描单个演员订阅的所有作品 ---
+def task_scan_actor_media(processor: ActorSubscriptionProcessor, subscription_id: int):
+    """【新】后台任务：扫描单个演员订阅的所有作品。"""
+    logger.trace(f"手动刷新任务(ID: {subscription_id})：开始准备Emby媒体库数据...")
+    
+    # 在调用核心扫描函数前，必须先获取Emby数据
+    emby_tmdb_ids = set()
+    try:
+        # 从 processor 或全局配置中获取 Emby 连接信息
+        config = processor.config # 假设 processor 对象中存有配置
+        emby_url = config.get('emby_server_url')
+        emby_api_key = config.get('emby_api_key')
+        emby_user_id = config.get('emby_user_id')
+
+        all_libraries = emby_handler.get_emby_libraries(emby_url, emby_api_key, emby_user_id)
+        library_ids_to_scan = [lib['Id'] for lib in all_libraries if lib.get('CollectionType') in ['movies', 'tvshows']]
+        emby_items = emby_handler.get_emby_library_items(base_url=emby_url, api_key=emby_api_key, user_id=emby_user_id, library_ids=library_ids_to_scan, media_type_filter="Movie,Series")
+        
+        emby_tmdb_ids = {item['ProviderIds'].get('Tmdb') for item in emby_items if item.get('ProviderIds', {}).get('Tmdb')}
+        logger.debug(f"手动刷新任务：已从 Emby 获取 {len(emby_tmdb_ids)} 个媒体ID。")
+
+    except Exception as e:
+        logger.error(f"手动刷新任务：在获取Emby媒体库信息时失败: {e}", exc_info=True)
+        # 获取失败时，可以传递一个空集合，让扫描逻辑继续（但可能不准确），或者直接返回
+        # 这里选择继续，让用户至少能更新TMDb信息
+
+    # 现在，带着准备好的 emby_tmdb_ids 调用函数
+    processor.run_full_scan_for_actor(subscription_id, emby_tmdb_ids)
+# --- 演员订阅 ---
+def task_process_actor_subscriptions(processor: ActorSubscriptionProcessor):
+    """【新】后台任务：执行所有启用的演员订阅扫描。"""
+    processor.run_scheduled_task(update_status_callback=update_status_from_thread)
 # ★★★ 1. 定义一个webhoo专用追剧、用于编排任务的函数 ★★★
 def webhook_processing_task(processor: MediaProcessor, item_id: str, force_reprocess: bool, process_episodes: bool):
     """
@@ -1193,157 +925,318 @@ def webhook_processing_task(processor: MediaProcessor, item_id: str, force_repro
     
     logger.debug(f"Webhook 任务完成: {item_id}")
 # --- 追剧 ---    
-def task_process_watchlist(processor: WatchlistProcessor):
+def task_process_watchlist(processor: WatchlistProcessor, item_id: Optional[str] = None):
     """
-    任务：处理追剧列表。
+    【V9 - 启动器】
+    调用处理器实例来执行追剧任务，并处理UI状态更新。
     """
-    # 不传递 item_id，执行全量更新
-    processor.process_watching_list()
-# ★★★ 只更新追剧列表中的一个特定项目 ★★★
-def task_process_single_watchlist_item(processor: WatchlistProcessor, item_id: str):
-    """任务：只更新追剧列表中的一个特定项目"""
-    # 传递 item_id，执行单项更新
-    processor.process_watching_list(item_id=item_id)
-# ★★★ 导入映射表 + 元数据 ★★★
-def task_import_person_map(processor, file_content: str, **kwargs):
-    """
-    【V3 - 元数据增强版】从CSV文件字符串中，导入演员映射表和元数据。
-    """
-    task_name = "导入完整演员数据"
-    logger.info(f"后台任务 '{task_name}' 开始执行...")
-    update_status_from_thread(0, "准备开始导入...")
+    # 定义一个可以传递给处理器的回调函数
+    def progress_updater(progress, message):
+        # 这里的 update_status_from_thread 是你项目中用于更新UI的函数
+        update_status_from_thread(progress, message)
 
     try:
-        # ✨ 1. 从 processor 获取必要的配置和工具 ✨
-        config = processor.config
-        tmdb_api_key = config.get("tmdb_api_key")
-        stop_event = processor.get_stop_event()
-
-        # --- 数据准备 (这部分逻辑不变) ---
-        lines = file_content.splitlines()
-        total_lines = len(lines) - 1 if len(lines) > 0 else 0
-        if total_lines <= 0:
-            update_status_from_thread(100, "导入完成：文件为空或只有表头。")
-            return
-            
-        stream_for_reader = StringIO(file_content, newline=None)
-        csv_reader = csv.DictReader(stream_for_reader)
-        
-        stats = {"total": total_lines, "processed": 0, "skipped": 0, "errors": 0}
-        
-        # ✨✨✨ 核心修改在这里 ✨✨✨
-        # 1. 创建 ActorDBManager 的实例
-        db_manager = ActorDBManager(DB_PATH) 
-
-        # 2. 使用 with 和中央函数获取连接
-        with get_central_db_connection(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            for i, row in enumerate(csv_reader):
-                if stop_event and stop_event.is_set():
-                    logger.info("导入任务被用户中止。")
-                    break
-
-                # ★★★ 1. 拆分数据：为两个表分别准备数据字典 ★★★
-                
-                # 1.1 准备 person_identity_map 的数据
-                person_map_data = {
-                    "name": row.get('primary_name'),
-                    "tmdb_id": row.get('tmdb_person_id') or None,
-                    "imdb_id": row.get('imdb_id') or None,
-                    "douban_id": row.get('douban_celebrity_id') or None,
-                }
-
-                # 1.2 准备 ActorMetadata 的数据
-                actor_metadata = {
-                    "tmdb_id": row.get('tmdb_person_id'),
-                    "profile_path": row.get('profile_path') or None,
-                    "gender": row.get('gender') or None,
-                    "adult": row.get('adult') or None,
-                    "popularity": row.get('popularity') or None,
-                    "original_name": row.get('original_name') or None,
-                }
-
-                # 如果连最基本的ID都没有，就跳过
-                if not person_map_data["name"] and not person_map_data["tmdb_id"]:
-                    stats["skipped"] += 1
-                    continue
-
-                try:
-                    # ★★★ 2. 执行数据库操作：分两步走 ★★★
-                    
-                    # 2.1 先插入或更新身份映射表
-                    db_manager.upsert_person(cursor, person_map_data)
-                    
-                    # 2.2 如果有元数据，再插入或更新元数据表
-                    #     我们只在有 tmdb_id 的情况下才操作元数据表
-                    if actor_metadata["tmdb_id"]:
-                        # 为了健壮性，将 None 转换为空字符串或0
-                        # 注意：SQLite对布尔值的处理，通常是 1 和 0
-                        adult_val = row.get('adult')
-                        is_adult = 1 if adult_val and str(adult_val).lower() in ['true', '1', 'yes'] else 0
-
-                        sql_upsert_metadata = """
-                            INSERT OR REPLACE INTO ActorMetadata 
-                            (tmdb_id, profile_path, gender, adult, popularity, original_name, last_updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        """
-                        cursor.execute(sql_upsert_metadata, (
-                            actor_metadata["tmdb_id"],
-                            actor_metadata["profile_path"],
-                            actor_metadata["gender"],
-                            is_adult,
-                            actor_metadata["popularity"],
-                            actor_metadata["original_name"]
-                        ))
-
-                    stats["processed"] += 1
-                except Exception as e_row:
-                    logger.error(f"处理导入文件第 {i+2} 行时发生错误: {e_row}", exc_info=True)
-                    stats["errors"] += 1
-                
-                if i > 0 and i % 100 == 0 and total_lines > 0:
-                    progress = int(((i + 1) / total_lines) * 100)
-                    update_status_from_thread(progress, f"正在导入... ({i+1}/{total_lines})")
-            
-            conn.commit()
-
-        message = f"导入完成。总行数: {stats['total']}, 成功处理: {stats['processed']}, 跳过: {stats['skipped']}, 错误: {stats['errors']}"
-        logger.info(f"导入任务完成: {message}")
-        update_status_from_thread(100, "导入完成！")
+        # 直接调用 processor 实例的方法，并将回调函数传入
+        processor.run_regular_processing_task(progress_callback=progress_updater, item_id=item_id)
 
     except Exception as e:
-        logger.error(f"后台导入任务失败: {e}", exc_info=True)
-        update_status_from_thread(-1, f"导入失败: {e}")
+        task_name = "追剧列表更新"
+        if item_id:
+            task_name = f"单项追剧更新 (ID: {item_id})"
+        logger.error(f"执行 '{task_name}' 时发生顶层错误: {e}", exc_info=True)
+        progress_updater(-1, f"启动任务时发生错误: {e}")
+# ★★★ 只更新追剧列表中的一个特定项目 ★★★
+def task_refresh_single_watchlist_item(processor: WatchlistProcessor, item_id: str):
+    """
+    【V11 - 新增】后台任务：只刷新追剧列表中的一个特定项目。
+    这是一个职责更明确的函数，专门用于手动触发。
+    """
+    # 定义一个可以传递给处理器的回调函数
+    def progress_updater(progress, message):
+        update_status_from_thread(progress, message)
+
+    try:
+        # 直接调用处理器的主方法，并将 item_id 传入
+        # 这会执行完整的元数据刷新、状态检查和数据库更新流程
+        processor.run_regular_processing_task(progress_callback=progress_updater, item_id=item_id)
+
+    except Exception as e:
+        task_name = f"单项追剧刷新 (ID: {item_id})"
+        logger.error(f"执行 '{task_name}' 时发生顶层错误: {e}", exc_info=True)
+        progress_updater(-1, f"启动任务时发生错误: {e}")
+# ★★★ 执行数据库导入的后台任务 ★★★
+def task_import_database(processor, file_content: str, tables_to_import: list, import_mode: str):
+    """
+    【后台任务 V12 - 最终完整正确版】
+    - 修正了所有摘要日志的收集和打印逻辑，确保在正确的循环层级执行，每个表只生成一条摘要。
+    """
+    task_name = f"数据库导入 ({import_mode}模式)"
+    logger.info(f"后台任务开始：{task_name}，处理表: {tables_to_import}。")
+    update_status_from_thread(0, "准备开始导入...")
+    
+    AUTOINCREMENT_KEYS_TO_IGNORE = ['map_id', 'id']
+    TRANSLATION_SOURCE_PRIORITY = {'manual': 2, 'openai': 1, 'zhipuai': 1, 'gemini': 1}
+    
+    summary_lines = []
+
+    TABLE_TRANSLATIONS = {
+        'person_identity_map': '演员映射表',
+        'ActorMetadata': '演员元数据',
+        'translation_cache': '翻译缓存',
+        'watchlist': '智能追剧列表',
+        'actor_subscriptions': '演员订阅配置',
+        'tracked_actor_media': '已追踪的演员作品',
+        'collections_info': '电影合集信息',
+        'processed_log': '已处理列表',
+        'failed_log': '待复核列表',
+        'users': '用户账户',
+    }
+
+    try:
+        backup = json.loads(file_content)
+        backup_data = backup.get("data", {})
+        stop_event = processor.get_stop_event()
+
+        for table_name in tables_to_import:
+            if table_name not in backup_data:
+                logger.warning(f"请求恢复的表 '{table_name}' 在备份文件中不存在，将跳过。")
+
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("BEGIN TRANSACTION;")
+            logger.info("数据库事务已开始。")
+
+            try:
+                # 外层循环：遍历所有要处理的表
+                for table_name in tables_to_import:
+                    cn_name = TABLE_TRANSLATIONS.get(table_name, table_name)
+                    if stop_event and stop_event.is_set():
+                        logger.info("导入任务被用户中止。")
+                        break
+                    
+                    table_data = backup_data.get(table_name, [])
+                    if not table_data:
+                        logger.debug(f"表 '{cn_name}' 在备份中没有数据，跳过。")
+                        summary_lines.append(f"  - 表 '{cn_name}': 跳过 (备份中无数据)。")
+                        continue
+
+                    # --- 特殊处理 person_identity_map ---
+                    if table_name == 'person_identity_map' and import_mode == 'merge':
+                        cn_name = TABLE_TRANSLATIONS.get(table_name, table_name)
+                        logger.info(f"模式[共享合并]: 正在为 '{cn_name}' 表执行合并策略...")
+                        
+                        cursor.execute("SELECT * FROM person_identity_map")
+                        local_rows = cursor.fetchall()
+                        id_to_local_row = {row['map_id']: dict(row) for row in local_rows}
+                        
+                        # --- 阶段 A: 在内存中计算最终合并方案 ---
+                        inserts, simple_updates, complex_merges = [], [], []
+                        
+                        live_tmdb_map = {row['tmdb_person_id']: row['map_id'] for row in local_rows if row['tmdb_person_id']}
+                        live_emby_map = {row['emby_person_id']: row['map_id'] for row in local_rows if row['emby_person_id']}
+                        live_imdb_map = {row['imdb_id']: row['map_id'] for row in local_rows if row['imdb_id']}
+                        live_douban_map = {row['douban_celebrity_id']: row['map_id'] for row in local_rows if row['douban_celebrity_id']}
+
+                        for backup_row in table_data:
+                            matched_map_ids = set()
+                            for key, lookup_map in [('tmdb_person_id', live_tmdb_map), ('emby_person_id', live_emby_map), ('imdb_id', live_imdb_map), ('douban_celebrity_id', live_douban_map)]:
+                                backup_id = backup_row.get(key)
+                                if backup_id and backup_id in lookup_map:
+                                    matched_map_ids.add(lookup_map[backup_id])
+                            
+                            if not matched_map_ids:
+                                inserts.append(backup_row)
+                            elif len(matched_map_ids) == 1:
+                                survivor_id = matched_map_ids.pop()
+                                consolidated_row = id_to_local_row[survivor_id].copy()
+                                needs_update = False
+                                for key in backup_row:
+                                    if backup_row.get(key) and not consolidated_row.get(key):
+                                        consolidated_row[key] = backup_row[key]
+                                        needs_update = True
+                                if needs_update:
+                                    simple_updates.append(consolidated_row)
+                            else:
+                                survivor_id = min(matched_map_ids)
+                                victim_ids = list(matched_map_ids - {survivor_id})
+                                complex_merges.append({'survivor_id': survivor_id, 'victim_ids': victim_ids, 'backup_row': backup_row})
+                                # 更新动态查找字典，将牺牲者的ID重定向到幸存者
+                                for vid in victim_ids:
+                                    victim_row = id_to_local_row[vid]
+                                    for key, lookup_map in [('tmdb_person_id', live_tmdb_map), ('emby_person_id', live_emby_map), ('imdb_id', live_imdb_map), ('douban_celebrity_id', live_douban_map)]:
+                                        if victim_row.get(key) and victim_row[key] in lookup_map:
+                                            lookup_map[victim_row[key]] = survivor_id
+
+                        # --- 阶段 B: 根据计算出的最终方案，执行数据库操作 ---
+                        
+                        # 1. 逐个处理最危险的复杂合并
+                        processed_complex_merges = 0
+                        deleted_from_complex = 0
+                        for merge_case in complex_merges:
+                            survivor_id = merge_case['survivor_id']
+                            victim_ids = merge_case['victim_ids']
+                            backup_row = merge_case['backup_row']
+                            
+                            # 重新获取最新的幸存者数据
+                            cursor.execute("SELECT * FROM person_identity_map WHERE map_id = ?", (survivor_id,))
+                            survivor_row = dict(cursor.fetchone())
+                            
+                            all_sources = [id_to_local_row[vid] for vid in victim_ids] + [backup_row]
+                            for source_row in all_sources:
+                                for key in source_row:
+                                    if source_row.get(key) and not survivor_row.get(key):
+                                        survivor_row[key] = source_row[key]
+                            
+                            # 腾位 -> 入住 -> 清理
+                            sql_clear = "UPDATE person_identity_map SET tmdb_person_id=NULL, emby_person_id=NULL, imdb_id=NULL, douban_celebrity_id=NULL WHERE map_id = ?"
+                            cursor.executemany(sql_clear, [(vid,) for vid in victim_ids])
+                            
+                            cols = [c for c in survivor_row.keys() if c not in AUTOINCREMENT_KEYS_TO_IGNORE]
+                            set_str = ", ".join([f'"{c}" = ?' for c in cols])
+                            sql_update = f"UPDATE person_identity_map SET {set_str} WHERE map_id = ?"
+                            data = [survivor_row.get(c) for c in cols] + [survivor_id]
+                            cursor.execute(sql_update, tuple(data))
+                            
+                            cursor.executemany("DELETE FROM person_identity_map WHERE map_id = ?", [(vid,) for vid in victim_ids])
+                            processed_complex_merges += 1
+                            deleted_from_complex += len(victim_ids)
+
+                        # 2. 批量处理简单的增补更新
+                        if simple_updates:
+                            unique_updates = {row['map_id']: row for row in simple_updates}.values()
+                            sql_update = "UPDATE person_identity_map SET primary_name = ?, tmdb_person_id = ?, imdb_id = ?, douban_celebrity_id = ? WHERE map_id = ?"
+                            data = [(r.get('primary_name'), r.get('tmdb_person_id'), r.get('imdb_id'), r.get('douban_celebrity_id'), r['map_id']) for r in unique_updates]
+                            cursor.executemany(sql_update, data)
+
+                        # 3. 批量处理全新的插入
+                        if inserts:
+                            sql_insert = "INSERT INTO person_identity_map (primary_name, tmdb_person_id, imdb_id, douban_celebrity_id) VALUES (?, ?, ?, ?)"
+                            data = [(r.get('primary_name'), r.get('tmdb_person_id'), r.get('imdb_id'), r.get('douban_celebrity_id')) for r in inserts]
+                            cursor.executemany(sql_insert, data)
+                        
+                        summary_lines.append(f"  - 表 '{cn_name}': 新增 {len(inserts)} 条, 简单增补 {len(simple_updates)} 条, 复杂合并 {processed_complex_merges} 组 (清理冗余 {deleted_from_complex} 条)。")
+
+                    # --- 特殊处理 translation_cache ---
+                    elif table_name == 'translation_cache' and import_mode == 'merge':
+                        cn_name = TABLE_TRANSLATIONS.get(table_name, table_name)
+                        logger.info(f"模式[共享合并]: 正在为 '{cn_name}' 表执行基于优先级的合并策略...")
+                        cursor.execute("SELECT original_text, translated_text, engine_used FROM translation_cache")
+                        local_cache_data = {row['original_text']: {'text': row['translated_text'], 'engine': row['engine_used'], 'priority': TRANSLATION_SOURCE_PRIORITY.get(row['engine_used'], 0)} for row in cursor.fetchall()}
+                        inserts, updates, kept = [], [], 0
+                        for backup_row in table_data:
+                            original_text = backup_row.get('original_text')
+                            if not original_text: continue
+                            backup_engine = backup_row.get('engine_used')
+                            backup_priority = TRANSLATION_SOURCE_PRIORITY.get(backup_engine, 0)
+                            if original_text not in local_cache_data:
+                                inserts.append(backup_row)
+                            else:
+                                local_data = local_cache_data[original_text]
+                                if backup_priority > local_data['priority']:
+                                    updates.append(backup_row)
+                                    logger.trace(f"  -> 冲突: '{original_text}'. 备份源({backup_engine}|P{backup_priority}) > 本地源({local_data['engine']}|P{local_data['priority']}). [决策: 更新]")
+                                else:
+                                    kept += 1
+                                    logger.trace(f"  -> 冲突: '{original_text}'. 本地源({local_data['engine']}|P{local_data['priority']}) >= 备份源({backup_engine}|P{backup_priority}). [决策: 保留]")
+                        if inserts:
+                            cols = list(inserts[0].keys()); col_str = ", ".join(f'"{c}"' for c in cols); val_ph = ", ".join(["?"] * len(cols))
+                            sql = f"INSERT INTO translation_cache ({col_str}) VALUES ({val_ph})"
+                            data = [[row.get(c) for c in cols] for row in inserts]
+                            cursor.executemany(sql, data)
+                        if updates:
+                            cols = list(updates[0].keys()); col_str = ", ".join(f'"{c}"' for c in cols); val_ph = ", ".join(["?"] * len(cols))
+                            sql = f"INSERT OR REPLACE INTO translation_cache ({col_str}) VALUES ({val_ph})"
+                            data = [[row.get(c) for c in cols] for row in updates]
+                            cursor.executemany(sql, data)
+                        summary_lines.append(f"  - 表 '{cn_name}': 新增 {len(inserts)} 条, 更新 {len(updates)} 条, 保留本地 {kept} 条。")
+                    
+                    # --- 通用合并/覆盖逻辑 ---
+                    else:
+                        mode_str = "本地恢复" if import_mode == 'overwrite' else "共享合并"
+                        logger.info(f"模式[{mode_str}]: 正在处理表 '{cn_name}'...")
+                        if import_mode == 'overwrite':
+                            cursor.execute(f"DELETE FROM {table_name};")
+                        logical_key = TABLE_PRIMARY_KEYS.get(table_name)
+                        if import_mode == 'merge' and not logical_key:
+                            logger.warning(f"表 '{cn_name}' 未定义主键，跳过合并。")
+                            summary_lines.append(f"  - 表 '{table_name}': 跳过 (未定义合并键)。")
+                            continue
+                        all_cols = list(table_data[0].keys())
+                        cols_for_op = [c for c in all_cols if c not in AUTOINCREMENT_KEYS_TO_IGNORE]
+                        col_str = ", ".join(f'"{c}"' for c in cols_for_op)
+                        val_ph = ", ".join(["?"] * len(cols_for_op))
+                        sql = ""
+                        if import_mode == 'merge':
+                            conflict_key_str = ""; logical_key_set = set()
+                            if isinstance(logical_key, str):
+                                conflict_key_str = logical_key; logical_key_set = {logical_key}
+                            elif isinstance(logical_key, tuple):
+                                conflict_key_str = ", ".join(logical_key); logical_key_set = set(logical_key)
+                            update_cols = [c for c in cols_for_op if c not in logical_key_set]
+                            update_str = ", ".join([f'"{col}" = excluded."{col}"' for col in update_cols])
+                            sql = (f"INSERT INTO {table_name} ({col_str}) VALUES ({val_ph}) "
+                                   f"ON CONFLICT({conflict_key_str}) DO UPDATE SET {update_str}")
+                        else:
+                            sql = f"INSERT INTO {table_name} ({col_str}) VALUES ({val_ph})"
+                        data = [[row.get(c) for c in cols_for_op] for row in table_data]
+                        cursor.executemany(sql, data)
+                        if import_mode == 'overwrite':
+                            summary_lines.append(f"  - 表 '{cn_name}': 清空并插入 {len(data)} 条。")
+                        else:
+                            summary_lines.append(f"  - 表 '{cn_name}': 合并处理了 {len(data)} 条。")
+
+                # --- 打印统一的摘要报告 ---
+                logger.info("="*11 + " 数据库导入摘要 " + "="*11)
+                if not summary_lines:
+                    logger.info("  -> 本次操作没有对任何表进行改动。")
+                else:
+                    for line in summary_lines:
+                        logger.info(line)
+                logger.info("="*36)
+
+                if not (stop_event and stop_event.is_set()):
+                    conn.commit()
+                    logger.info("数据库事务已成功提交！所有选择的表已恢复。")
+                    update_status_from_thread(100, "导入成功完成！")
+                else:
+                    conn.rollback()
+                    logger.warning("任务被中止，数据库操作已回滚。")
+                    update_status_from_thread(-1, "任务已中止，所有更改已回滚。")
+
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"在事务处理期间发生严重错误，操作已回滚: {e}", exc_info=True)
+                update_status_from_thread(-1, f"数据库错误，操作已回滚: {e}")
+                raise
+
+    except Exception as e:
+        logger.error(f"数据库恢复任务执行失败: {e}", exc_info=True)
+        update_status_from_thread(-1, f"任务失败: {e}")
 # ★★★ 重新处理单个项目 ★★★
-def task_reprocess_single_item(processor: MediaProcessor, item_id: str):
+def task_reprocess_single_item(processor: MediaProcessor, item_id: str, item_name_for_ui: str):
     """
-    【最终正确版 - 高效简洁】
-    后台任务：通过强制在线获取TMDb最新数据的方式，重新处理单个项目。
+    【最终版 - 职责分离】后台任务。
+    此版本负责在任务开始时设置“正在处理”的状态，并执行核心逻辑。
     """
-    # ✨ 1. 直接使用 ItemID 作为日志标识，不再预先获取项目名
-    item_name_for_log = f"ItemID: {item_id}"
-    logger.debug(f"--- 开始执行“重新处理单个项目”任务 ({item_name_for_log}) [强制在线获取模式] ---")
+    logger.debug(f"--- 后台任务开始执行 ({item_name_for_ui}) ---")
     
     try:
-        # ✨ 2. 状态更新也直接使用 ItemID
-        update_status_from_thread(10, f"正在处理: {item_name_for_log}")
+        # ✨ 关键修改：任务一开始，就用“正在处理”的状态覆盖掉旧状态
+        update_status_from_thread(0, f"正在处理: {item_name_for_ui}")
 
-        # ✨ 3. 【核心修改】直接调用核心处理器，不再有任何预先的API调用
-        #    由 process_single_item 自己去获取详情并打印唯一的开始日志
-        logger.debug(f"为 '{item_name_for_log}' 调用核心处理器，并设置强制在线获取标志...")
-        
+        # 现在才开始真正的工作
         processor.process_single_item(
             item_id, 
             force_reprocess_this_item=True,
             force_fetch_from_tmdb=True
         )
-        
-        logger.debug(f"--- “重新处理单个项目”任务完成 ({item_name_for_log}) ---")
+        # 任务成功完成后的状态更新会自动由任务队列处理，我们无需关心
+        logger.debug(f"--- 后台任务完成 ({item_name_for_ui}) ---")
 
     except Exception as e:
-        logger.error(f"重新处理 '{item_name_for_log}' 时发生严重错误: {e}", exc_info=True)
-        update_status_from_thread(-1, f"重新处理失败: {e}")
+        logger.error(f"后台任务处理 '{item_name_for_ui}' 时发生严重错误: {e}", exc_info=True)
+        update_status_from_thread(-1, f"处理失败: {item_name_for_ui}")
 # --- 翻译演员任务 ---
 def task_actor_translation_cleanup(processor):
     """
@@ -1481,13 +1374,379 @@ def image_update_task(processor: MediaProcessor, item_id: str, update_descriptio
         return
 
     logger.debug(f"图片更新任务完成: {item_id}")
+# ✨ 辅助函数，并发刷新合集使用
+def _process_single_collection_concurrently(collection_data: dict, db_path: str, tmdb_api_key: str) -> dict:
+    """
+    【V2 - 状态增强版】
+    在单个线程中处理单个合集的所有逻辑。
+    - 为合集中的每一部电影标记状态: in_library, missing, unreleased, subscribed
+    - 保留已有的 subscribed 状态
+    """
+    collection_id = collection_data['Id']
+    collection_name = collection_data.get('Name', '')
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    
+    # 每个线程创建自己的数据库连接
+    with get_central_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        
+        # 1. 读取历史状态，主要是为了获取哪些电影之前是 'subscribed'
+        cursor.execute("SELECT missing_movies_json FROM collections_info WHERE emby_collection_id = ?", (collection_id,))
+        row = cursor.fetchone()
+        previous_movies_map = {}
+        if row and row[0]:
+            try:
+                previous_movies = json.loads(row[0])
+                # 创建一个以 tmdb_id 为键的字典，方便快速查找
+                previous_movies_map = {str(m['tmdb_id']): m for m in previous_movies}
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # 2. 准备数据
+    all_movies_with_status = []
+    emby_movie_tmdb_ids = set(collection_data.get("ExistingMovieTmdbIds", []))
+    in_library_count = len(emby_movie_tmdb_ids)
+    status, has_missing = "ok", False
+
+    provider_ids = collection_data.get("ProviderIds", {})
+    tmdb_id = provider_ids.get("TmdbCollection") or provider_ids.get("TmdbCollectionId") or provider_ids.get("Tmdb")
+
+    if not tmdb_id:
+        status = "unlinked"
+    else:
+        details = tmdb_handler.get_collection_details_tmdb(int(tmdb_id), tmdb_api_key)
+        if not details or "parts" not in details:
+            status = "tmdb_error"
+        else:
+            # 3. 遍历TMDb合集中的所有电影，并确定它们各自的状态
+            for movie in details.get("parts", []):
+                movie_tmdb_id = str(movie.get("id"))
+                title = movie.get("title", "")
+                # 过滤掉一些不规范的数据
+                if not movie.get("release_date") or not re.search(r'[\u4e00-\u9fa5]', title):
+                    continue
+
+                movie_status = "unknown" # 默认状态
+                
+                # --- 状态判断优先级 ---
+                # 1. 已入库？ (最高优先级)
+                if movie_tmdb_id in emby_movie_tmdb_ids:
+                    movie_status = "in_library"
+                # 2. 未上映？
+                elif movie.get("release_date", '') > today_str:
+                    movie_status = "unreleased"
+                # 3. 之前是否已订阅？ (如果未入库，则保留订阅状态)
+                elif previous_movies_map.get(movie_tmdb_id, {}).get('status') == 'subscribed':
+                    movie_status = "subscribed"
+                # 4. 都不是，那就是缺失
+                else:
+                    movie_status = "missing"
+
+                all_movies_with_status.append({
+                    "tmdb_id": movie_tmdb_id, 
+                    "title": title, 
+                    "release_date": movie.get("release_date"), 
+                    "poster_path": movie.get("poster_path"), 
+                    "status": movie_status
+                })
+            
+            # 4. 根据最终的电影状态列表，确定整个合集的状态
+            if any(m['status'] == 'missing' for m in all_movies_with_status):
+                has_missing = True
+                status = "has_missing"
+    
+    image_tag = collection_data.get("ImageTags", {}).get("Primary")
+    poster_path = f"/Items/{collection_id}/Images/Primary?tag={image_tag}" if image_tag else None
+
+    # 5. 将所有结果打包返回
+    return {
+        "emby_collection_id": collection_id, "name": collection_name, "tmdb_collection_id": tmdb_id, 
+        "status": status, "has_missing": has_missing, 
+        # ★★★ 核心改变：现在存储的是包含所有状态的完整列表
+        "missing_movies_json": json.dumps(all_movies_with_status), 
+        "last_checked_at": time.time(), "poster_path": poster_path, "in_library_count": in_library_count
+    }
+# ★★★ 刷新合集的后台任务函数 ★★★
+def task_refresh_collections(processor: MediaProcessor):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    update_status_from_thread(0, "正在获取 Emby 合集列表...")
+    try:
+        emby_collections = emby_handler.get_all_collections_with_items(
+            base_url=processor.emby_url, api_key=processor.emby_api_key, user_id=processor.emby_user_id
+        )
+        if emby_collections is None: raise RuntimeError("从 Emby 获取合集列表失败")
+
+        total = len(emby_collections)
+        update_status_from_thread(5, f"共找到 {total} 个合集，准备开始并发处理...")
+
+        # 清理数据库中已不存在的合集
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
+            cursor = conn.cursor()
+            emby_current_ids = {c['Id'] for c in emby_collections}
+            cursor.execute("SELECT emby_collection_id FROM collections_info")
+            db_known_ids = {row[0] for row in cursor.fetchall()}
+            deleted_ids = db_known_ids - emby_current_ids
+            if deleted_ids:
+                cursor.executemany("DELETE FROM collections_info WHERE emby_collection_id = ?", [(id,) for id in deleted_ids])
+            conn.commit()
+
+        tmdb_api_key = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_TMDB_API_KEY)
+        if not tmdb_api_key: raise RuntimeError("未配置 TMDb API Key")
+
+        processed_count = 0
+        all_results = []
+        
+        # ✨ 核心修改：使用线程池进行并发处理
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            # 提交所有任务
+            futures = {executor.submit(_process_single_collection_concurrently, collection, config_manager.DB_PATH, tmdb_api_key): collection for collection in emby_collections}
+            
+            # 实时获取已完成的结果并更新进度条
+            for future in as_completed(futures):
+                if processor.is_stop_requested():
+                    # 如果用户请求停止，我们可以尝试取消未开始的任务
+                    for f in futures: f.cancel()
+                    break
+                
+                collection_name = futures[future].get('Name', '未知合集')
+                try:
+                    result = future.result()
+                    all_results.append(result)
+                except Exception as e:
+                    logger.error(f"处理合集 '{collection_name}' 时线程内发生错误: {e}", exc_info=True)
+                
+                processed_count += 1
+                progress = 10 + int((processed_count / total) * 90)
+                update_status_from_thread(progress, f"处理中: {collection_name[:20]}... ({processed_count}/{total})")
+
+        if processor.is_stop_requested():
+            logger.warning("任务被用户中断，部分数据可能未被处理。")
+            # 即使被中断，我们依然保存已成功处理的结果
+        
+        # ✨ 所有并发任务完成后，在主线程中安全地、一次性地写入数据库
+        if all_results:
+            logger.info(f"并发处理完成，准备将 {len(all_results)} 条结果写入数据库...")
+            with get_central_db_connection(config_manager.DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("BEGIN TRANSACTION;")
+                try:
+                    cursor.executemany("""
+                        INSERT OR REPLACE INTO collections_info 
+                        (emby_collection_id, name, tmdb_collection_id, status, has_missing, missing_movies_json, last_checked_at, poster_path, in_library_count)
+                        VALUES (:emby_collection_id, :name, :tmdb_collection_id, :status, :has_missing, :missing_movies_json, :last_checked_at, :poster_path, :in_library_count)
+                    """, all_results)
+                    conn.commit()
+                    logger.info("数据库写入成功！")
+                except Exception as e_db:
+                    logger.error(f"数据库批量写入时发生错误: {e_db}", exc_info=True)
+                    conn.rollback()
+        
+    except Exception as e:
+        logger.error(f"刷新合集任务失败: {e}", exc_info=True)
+        update_status_from_thread(-1, f"错误: {e}")
+# ★★★ 带智能预判的自动订阅任务 ★★★
+def task_auto_subscribe(processor: MediaProcessor):
+    update_status_from_thread(0, "正在启动智能订阅任务...")
+    
+    if not config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_AUTOSUB_ENABLED):
+        logger.info("智能订阅总开关未开启，任务跳过。")
+        update_status_from_thread(100, "任务跳过：总开关未开启")
+        return
+
+    try:
+        today = date.today()
+        update_status_from_thread(10, f"智能订阅已启动...")
+        successfully_subscribed_items = []
+
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # --- 1. 处理电影合集 ---
+            update_status_from_thread(20, "正在检查缺失的电影...")
+            
+            sql_query_movies = "SELECT * FROM collections_info WHERE status = 'has_missing' AND missing_movies_json IS NOT NULL AND missing_movies_json != '[]'"
+            logger.debug(f"【智能订阅-电影】执行查询: {sql_query_movies}")
+            cursor.execute(sql_query_movies)
+            collections_to_check = cursor.fetchall()
+
+            logger.info(f"【智能订阅-电影】从数据库找到 {len(collections_to_check)} 个有缺失影片的电影合集需要检查。")
+
+            for collection in collections_to_check:
+                if processor.is_stop_requested(): break
+                
+                collection_name = collection['name']
+                logger.info(f"【智能订阅-电影】>>> 正在检查合集: 《{collection_name}》")
+
+                movies_to_keep = []
+                all_missing_movies = json.loads(collection['missing_movies_json'])
+                movies_changed = False
+                for movie in all_missing_movies:
+                    if processor.is_stop_requested(): break
+                    
+                    movie_title = movie.get('title', '未知电影')
+                    movie_status = movie.get('status', 'unknown')
+
+                    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                    # ★★★  核心逻辑修改：在这里处理 ignored 状态，打破死循环！ ★★★
+                    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                    if movie_status == 'ignored':
+                        logger.info(f"【智能订阅-电影】   -> 影片《{movie_title}》已被用户忽略，跳过。")
+                        movies_to_keep.append(movie) # 保持 ignored 状态，下次不再处理
+                        continue
+                    
+                    if movie_status == 'missing':
+                        release_date_str = movie.get('release_date')
+                        if release_date_str:
+                            release_date_str = release_date_str.strip()
+                        
+                        if not release_date_str:
+                            logger.warning(f"【智能订阅-电影】   -> 影片《{movie_title}》缺少上映日期，无法判断，跳过。")
+                            movies_to_keep.append(movie)
+                            continue
+                        
+                        try:
+                            release_date = datetime.strptime(release_date_str, '%Y-%m-%d').date()
+                        except (ValueError, TypeError):
+                            logger.warning(f"【智能订阅-电影】   -> 影片《{movie_title}》的上映日期 '{release_date_str}' 格式无效，跳过。")
+                            movies_to_keep.append(movie)
+                            continue
+
+                        if release_date <= today:
+                            logger.info(f"【智能订阅-电影】   -> 影片《{movie_title}》(上映日期: {release_date}) 已上映，符合订阅条件，正在提交...")
+                            
+                            try:
+                                success = moviepilot_handler.subscribe_movie_to_moviepilot(movie, config_manager.APP_CONFIG)
+                                if success:
+                                    logger.info(f"【智能订阅-电影】      -> 订阅成功！")
+                                    successfully_subscribed_items.append(f"电影《{movie['title']}》")
+                                    movies_changed = True # 订阅成功后，从缺失列表移除
+                                else:
+                                    logger.error(f"【智能订阅-电影】      -> MoviePilot报告订阅失败！将保留在缺失列表中。")
+                                    movies_to_keep.append(movie)
+                            except Exception as e:
+                                logger.error(f"【智能订阅-电影】      -> 提交订阅到MoviePilot时发生内部错误: {e}", exc_info=True)
+                                movies_to_keep.append(movie)
+                        else:
+                            logger.info(f"【智能订阅-电影】   -> 影片《{movie_title}》(上映日期: {release_date}) 尚未上映，跳过订阅。")
+                            movies_to_keep.append(movie)
+                    else:
+                        status_translation = {
+                            'unreleased': '未上映',
+                            # 可以在这里添加更多翻译
+                            'unknown': '未知状态'
+                        }
+                        # 使用 .get() 方法，如果找不到翻译，则显示原始状态，保证程序不会出错
+                        display_status = status_translation.get(movie_status, movie_status)
+                        # 此处会处理 'unreleased' 等其他所有状态
+                        logger.info(f"【智能订阅-电影】   -> 影片《{movie_title}》因状态为 '{display_status}'，本次跳过订阅检查。")
+                        movies_to_keep.append(movie)
+                
+                # 只有在订阅成功导致列表变化时才更新数据库
+                if movies_changed:
+                    # 重新生成缺失电影的JSON，只包含未被成功订阅的
+                    new_missing_json = json.dumps(movies_to_keep)
+                    # 如果更新后列表为空，可以顺便更新合集的状态
+                    new_status = 'ok' if not movies_to_keep else 'has_missing'
+                    cursor.execute("UPDATE collections_info SET missing_movies_json = ?, status = ? WHERE emby_collection_id = ?", (new_missing_json, new_status, collection['emby_collection_id']))
+
+            # --- 2. 处理剧集 ---
+            if not processor.is_stop_requested():
+                update_status_from_thread(60, "正在检查缺失的剧集...")
+                
+                sql_query = "SELECT * FROM watchlist WHERE status IN ('Watching', 'Paused') AND missing_info_json IS NOT NULL AND missing_info_json != '[]'"
+                logger.debug(f"【智能订阅-剧集】执行查询: {sql_query}")
+                cursor.execute(sql_query)
+                series_to_check = cursor.fetchall()
+                
+                logger.info(f"【智能订阅-剧集】从数据库找到 {len(series_to_check)} 部状态为'在追'或'暂停'且有缺失信息的剧集需要检查。")
+
+                for series in series_to_check:
+                    if processor.is_stop_requested(): break
+                    
+                    series_name = series['item_name']
+                    logger.info(f"【智能订阅-剧集】>>> 正在检查: 《{series_name}》")
+                    
+                    try:
+                        missing_info = json.loads(series['missing_info_json'])
+                        missing_seasons = missing_info.get('missing_seasons', [])
+                        
+                        if not missing_seasons:
+                            logger.info(f"【智能订阅-剧集】   -> 《{series_name}》没有记录在案的缺失季(missing_seasons为空)，跳过。")
+                            continue
+
+                        seasons_to_keep = []
+                        seasons_changed = False
+                        for season in missing_seasons:
+                            if processor.is_stop_requested(): break
+                            
+                            season_num = season.get('season_number')
+                            air_date_str = season.get('air_date')
+                            if air_date_str:
+                                air_date_str = air_date_str.strip()
+                            
+                            if not air_date_str:
+                                logger.warning(f"【智能订阅-剧集】   -> 《{series_name}》第 {season_num} 季缺少播出日期(air_date)，无法判断，跳过。")
+                                seasons_to_keep.append(season)
+                                continue
+                            
+                            try:
+                                season_date = datetime.strptime(air_date_str, '%Y-%m-%d').date()
+                            except (ValueError, TypeError):
+                                logger.warning(f"【智能订阅-剧集】   -> 《{series_name}》第 {season_num} 季的播出日期 '{air_date_str}' 格式无效，跳过。")
+                                seasons_to_keep.append(season)
+                                continue
+
+                            if season_date <= today:
+                                logger.info(f"【智能订阅-剧集】   -> 《{series_name}》第 {season_num} 季 (播出日期: {season_date}) 已播出，符合订阅条件，正在提交...")
+                                try:
+                                    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                                    # ★★★  核心修复：剧集订阅也需要传递 config_manager.APP_CONFIG！ ★★★
+                                    # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+                                    success = moviepilot_handler.subscribe_series_to_moviepilot(dict(series), season['season_number'], config_manager.APP_CONFIG)
+                                    if success:
+                                        logger.info(f"【智能订阅-剧集】      -> 订阅成功！")
+                                        successfully_subscribed_items.append(f"《{series['item_name']}》第 {season['season_number']} 季")
+                                        seasons_changed = True
+                                    else:
+                                        logger.error(f"【智能订阅-剧集】      -> MoviePilot报告订阅失败！将保留在缺失列表中。")
+                                        seasons_to_keep.append(season)
+                                except Exception as e:
+                                    logger.error(f"【智能订阅-剧集】      -> 提交订阅到MoviePilot时发生内部错误: {e}", exc_info=True)
+                                    seasons_to_keep.append(season)
+                            else:
+                                logger.info(f"【智能订阅-剧集】   -> 《{series_name}》第 {season_num} 季 (播出日期: {season_date}) 尚未播出，跳过订阅。")
+                                seasons_to_keep.append(season)
+                        
+                        if seasons_changed:
+                            missing_info['missing_seasons'] = seasons_to_keep
+                            cursor.execute("UPDATE watchlist SET missing_info_json = ? WHERE item_id = ?", (json.dumps(missing_info), series['item_id']))
+                    except Exception as e_series:
+                        logger.error(f"【智能订阅-剧集】处理剧集 '{series['item_name']}' 时出错: {e_series}")
+            
+            conn.commit()
+
+        if successfully_subscribed_items:
+            summary = "任务完成！已自动订阅: " + ", ".join(successfully_subscribed_items)
+            logger.info(summary)
+            update_status_from_thread(100, summary)
+        else:
+            update_status_from_thread(100, "任务完成：本次运行没有发现符合自动订阅条件的媒体。")
+
+    except Exception as e:
+        logger.error(f"智能订阅任务失败: {e}", exc_info=True)
+        update_status_from_thread(-1, f"错误: {e}")
 # --- 立即执行任务注册表 ---
 TASK_REGISTRY = {
     'full-scan': (task_process_full_library, "立即执行全量扫描"),
     'sync-person-map': (task_sync_person_map, "立即执行同步演员映射表"),
-    'process-watchlist': (task_process_watchlist, "立即执行智能追剧更新"),
-    'enrich-aliases': (task_enrich_aliases, "立即执行演员元数据增强"),
-    'actor-cleanup': (task_actor_translation_cleanup, "立即执行演员名翻译查漏补缺")
+    'process-watchlist': (task_process_watchlist, "立即执行智能追剧刷新"),
+    'enrich-aliases': (task_enrich_aliases, "立即执行演员元数据补充"),
+    'actor-cleanup': (task_actor_translation_cleanup, "立即执行演员名翻译"),
+    'refresh-collections': (task_refresh_collections, "立即执行电影合集刷新"),
+    'auto-subscribe': (task_auto_subscribe, "立即执行智能订阅"),
+    'actor-tracking': (task_process_actor_subscriptions, "立即执行演员订阅")
 }
 # --- 路由区 ---
 # --- webhook通知任务 ---
@@ -1519,12 +1778,12 @@ def emby_webhook():
 
     # --- 分支 A: 处理元数据新增/更新事件 ---
     if event_type in ["item.add", "library.new"]:
-        # 这部分是您原有的核心修复逻辑，保持不变
+        # 这部分是你原有的核心修复逻辑，保持不变
         id_to_process = original_item_id
         type_to_process = original_item_type
 
         if original_item_type == "Episode":
-            # ... (您原有的向上查找剧集ID的逻辑) ...
+            # ... (你原有的向上查找剧集ID的逻辑) ...
             logger.info(f"Webhook 收到分集 '{original_item_name}' (ID: {original_item_id})，正在向上查找其所属剧集...")
             series_id = emby_handler.get_series_id_from_child_id(
                 original_item_id,
@@ -1561,7 +1820,7 @@ def emby_webhook():
             
         logger.info(f"Webhook事件触发，最终处理项目 '{final_item_name}' (ID: {id_to_process}, TMDbID: {tmdb_id}) 已提交到任务队列。")
         
-        submit_task_to_queue(
+        success = task_manager.submit_task(
             webhook_processing_task,
             f"Webhook处理: {final_item_name}",
             id_to_process,
@@ -1578,7 +1837,7 @@ def emby_webhook():
         logger.info(f"Webhook 图片更新事件触发，项目 '{original_item_name}' (ID: {original_item_id})。描述: '{update_description}'")
         
         # ★★★ 核心修改点 2: 将 description 传递给任务队列 ★★★
-        submit_task_to_queue(
+        success = task_manager.submit_task(
             image_update_task,
             f"精准图片同步: {original_item_name}",
             # --- 传递给 image_update_task 的参数 ---
@@ -1589,48 +1848,14 @@ def emby_webhook():
         return jsonify({"status": "precise_image_task_queued", "item_id": original_item_id}), 202
     
     return jsonify({"status": "event_unhandled"}), 500
-    
-@app.route('/trigger_sync_person_map', methods=['POST'])
-def trigger_sync_person_map(): # WebUI 用的
-
-    task_name = "同步Emby演员映射表 (WebUI)"
-    logger.info(f"收到手动触发 '{task_name}' 的请求。")
-
-    submit_task_to_queue(
-        task_sync_person_map,
-        task_name
-    )
-
-    flash(f"'{task_name}' 任务已在后台启动。", "info")
-    return redirect(url_for('settings_page'))
-
-@app.route('/trigger_stop_task', methods=['POST'])
-def trigger_stop_task():
-    global background_task_status
-    if media_processor_instance and hasattr(media_processor_instance, 'signal_stop'):
-        media_processor_instance.signal_stop()
-        flash("已发送停止后台任务的请求。任务将在当前步骤完成后停止。", "info")
-        background_task_status["message"] = "正在尝试停止任务..."
-    else:
-        flash("错误：服务未就绪或不支持停止操作。", "error")
-    return redirect(url_for('settings_page'))
-
-@app.route('/status')
-def get_status():
-    return jsonify(background_task_status)
-
 #--- 日志 ---
 @app.route('/api/status', methods=['GET'])
 def api_get_task_status():
     global background_task_status, frontend_log_queue
     
-    status_data = background_task_status.copy() # 复制一份，避免线程问题
-    
-    # 将日志队列的内容添加到返回数据中
+    status_data = task_manager.get_task_status()
     status_data['logs'] = list(frontend_log_queue)
-    
     return jsonify(status_data)
-
 @app.route('/api/emby_libraries')
 def api_get_emby_libraries():
     # 确保 media_processor_instance 已初始化并且 Emby 配置有效
@@ -1651,7 +1876,6 @@ def api_get_emby_libraries():
     else: # get_emby_libraries 返回了 None，表示获取失败
         logger.error("/api/emby_libraries: 无法获取Emby媒体库列表 (emby_handler返回None)。")
         return jsonify({"error": "无法获取Emby媒体库列表，请检查Emby连接和日志"}), 500
-
 # --- 应用退出处理 ---
 def application_exit_handler():
     global media_processor_instance, scheduler, task_worker_thread
@@ -1662,25 +1886,8 @@ def application_exit_handler():
         logger.info("正在发送停止信号给当前任务...")
         media_processor_instance.signal_stop()
 
-    # 2. 清空任务队列，丢弃所有排队中的任务
-    if not task_queue.empty():
-        logger.info(f"队列中还有 {task_queue.qsize()} 个任务，正在清空...")
-        while not task_queue.empty():
-            try:
-                task_queue.get_nowait()
-            except Queue.Empty:
-                break
-        logger.info("任务队列已清空。")
-
-    # 3. 停止工人线程
-    if task_worker_thread and task_worker_thread.is_alive():
-        logger.info("正在发送停止信号给任务工人线程...")
-        task_queue.put(None) # 发送“毒丸”
-        task_worker_thread.join(timeout=5) # 等待线程退出
-        if task_worker_thread.is_alive():
-            logger.warning("任务工人线程在5秒内未能正常退出。")
-        else:
-            logger.info("任务工人线程已成功停止。")
+    task_manager.clear_task_queue()
+    task_manager.stop_task_worker()
 
     # 4. 关闭其他资源
     if media_processor_instance:
@@ -1689,10 +1896,8 @@ def application_exit_handler():
         scheduler.shutdown(wait=False)
     
     logger.info("atexit 清理操作执行完毕。")
-
 atexit.register(application_exit_handler)
 # --- 应用退出处理结束 ---
-
 # --- API 端点 搜索媒体库 ---
 @app.route('/api/search_emby_library', methods=['GET'])
 @processor_ready_required
@@ -1740,7 +1945,7 @@ def api_search_emby_library():
 @app.route('/api/auth/status', methods=['GET'])
 def auth_status():
     """检查当前认证状态"""
-    config = APP_CONFIG
+    config = config_manager.APP_CONFIG
     auth_enabled = config.get(constants.CONFIG_OPTION_AUTH_ENABLED, False)
     
     response = {
@@ -1749,7 +1954,6 @@ def auth_status():
         "username": session.get('username')
     }
     return jsonify(response)
-
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json
@@ -1763,7 +1967,7 @@ def login():
     
     # ✨✨✨ 核心修改在这里 ✨✨✨
     try:
-        with get_central_db_connection(DB_PATH) as conn:
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM users WHERE username = ?", (username_from_req,))
             user = cursor.fetchone()
@@ -1781,14 +1985,12 @@ def login():
     
     logger.warning(f"用户 '{username_from_req}' 登录失败：用户名或密码错误。")
     return jsonify({"error": "用户名或密码错误"}), 401
-
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
     username = session.get('username', '未知用户')
     session.clear()
     logger.info(f"用户 '{username}' 已注销。")
     return jsonify({"message": "注销成功"})
-
 # --- 认证 API 端点结束 ---
 @app.route('/api/auth/change_password', methods=['POST'])
 @login_required
@@ -1806,7 +2008,7 @@ def change_password():
     user_id = session.get('user_id')
     # ✨✨✨ 核心修改在这里 ✨✨✨
     try:
-        with get_central_db_connection(DB_PATH) as conn:
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
             cursor = conn.cursor()
             
             # 1. 查询用户
@@ -1842,18 +2044,18 @@ def change_password():
 def api_get_config():
     try:
         # ★★★ 确保这里正确解包了元组 ★★★
-        current_config = APP_CONFIG 
+        current_config = config_manager.APP_CONFIG 
         
         if current_config:
+            current_config['emby_server_id'] = EMBY_SERVER_ID
             logger.trace(f"API /api/config (GET): 成功加载并返回配置。")
             return jsonify(current_config)
         else:
-            logger.error(f"API /api/config (GET): APP_CONFIG 为空或未初始化。")
+            logger.error(f"API /api/config (GET): config_manager.APP_CONFIG 为空或未初始化。")
             return jsonify({"error": "无法加载配置数据"}), 500
     except Exception as e:
         logger.error(f"API /api/config (GET) 获取配置时发生错误: {e}", exc_info=True)
         return jsonify({"error": "获取配置信息时发生服务器内部错误"}), 500
-
 # --- API 端点：保存配置 ---
 @app.route('/api/config', methods=['POST'])
 def api_save_config():
@@ -1881,7 +2083,7 @@ def api_save_config():
         logger.info(f"API /api/config (POST): 收到新的配置数据，准备保存...")
         
         # 校验通过后，才调用保存函数
-        save_config(new_config_data) 
+        save_config_and_reload(new_config_data)  
         
         logger.debug("API /api/config (POST): 配置已成功传递给 save_config 函数。")
         return jsonify({"message": "配置已成功保存并已触发重新加载。"})
@@ -1889,7 +2091,6 @@ def api_save_config():
     except Exception as e:
         logger.error(f"API /api/config (POST) 保存配置时发生错误: {e}", exc_info=True)
         return jsonify({"error": f"保存配置时发生服务器内部错误: {str(e)}"}), 500
-
 # --- API 端点：获取待复核列表 ---
 @app.route('/api/review_items', methods=['GET'])
 def api_get_review_items():
@@ -1901,112 +2102,76 @@ def api_get_review_items():
     if per_page < 1: per_page = 10
     if per_page > 100: per_page = 100
 
-    offset = (page - 1) * per_page
-    
-    items_to_review = []
-    total_matching_items = 0
-    
-    # ✨✨✨ 核心修改在这里 ✨✨✨
     try:
-        with get_central_db_connection(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row # 确保可以按列名访问，这很重要
-            cursor = conn.cursor()
-            
-            where_clause = ""
-            sql_params = []
-
-            if query_filter:
-                where_clause = "WHERE item_name LIKE ?"
-                sql_params.append(f"%{query_filter}%")
-
-            # 1. 查询总数
-            count_sql = f"SELECT COUNT(*) FROM failed_log {where_clause}"
-            cursor.execute(count_sql, tuple(sql_params))
-            count_row = cursor.fetchone()
-            if count_row:
-                total_matching_items = count_row[0]
-
-            # 2. 查询当前页的数据
-            items_sql = f"""
-                SELECT item_id, item_name, failed_at, reason, item_type, score 
-                FROM failed_log 
-                {where_clause}
-                ORDER BY failed_at DESC 
-                LIMIT ? OFFSET ?
-            """
-            params_for_page_query = sql_params + [per_page, offset]
-            cursor.execute(items_sql, tuple(params_for_page_query))
-            fetched_rows = cursor.fetchall()
-            
-            for row in fetched_rows:
-                items_to_review.append(dict(row))
+        # +++ 核心修改：调用 db_handler 的高级函数 +++
+        items_to_review, total_matching_items = db_handler.get_review_items_paginated(
+            db_path=config_manager.DB_PATH,
+            page=page,
+            per_page=per_page,
+            query_filter=query_filter
+        )
         
-        # with 代码块结束，数据库连接已安全关闭
+        total_pages = (total_matching_items + per_page - 1) // per_page if total_matching_items > 0 else 0
+        
+        logger.debug(f"API /api/review_items: 返回 {len(items_to_review)} 条待复核项目 (总计: {total_matching_items}, 第 {page}/{total_pages} 页)")
+        return jsonify({
+            "items": items_to_review,
+            "total_items": total_matching_items,
+            "total_pages": total_pages,
+            "current_page": page,
+            "per_page": per_page,
+            "query": query_filter
+        })
 
     except Exception as e:
         logger.error(f"API /api/review_items 获取数据失败: {e}", exc_info=True)
         return jsonify({"error": "获取待复核列表时发生服务器内部错误"}), 500
-    # ✨✨✨ 修改结束 ✨✨✨
-            
-    # 这部分代码不需要数据库连接，所以放在 try...except 块外面是完全正确的
-    total_pages = (total_matching_items + per_page - 1) // per_page if total_matching_items > 0 else 0
-    
-    logger.debug(f"API /api/review_items: 返回 {len(items_to_review)} 条待复核项目 (总计: {total_matching_items}, 第 {page}/{total_pages} 页)")
-    return jsonify({
-        "items": items_to_review,
-        "total_items": total_matching_items,
-        "total_pages": total_pages,
-        "current_page": page,
-        "per_page": per_page,
-        "query": query_filter
-    })
 @app.route('/api/actions/mark_item_processed/<item_id>', methods=['POST'])
+@task_lock_required
 def api_mark_item_processed(item_id):
-    if task_lock.locked():
+    if task_manager.is_task_running():
         return jsonify({"error": "后台有长时间任务正在运行，请稍后再试。"}), 409
     
-    deleted_count = 0 # 在 try 块外部定义，以便 finally 之后能访问
-
-    # ✨✨✨ 核心修改在这里 ✨✨✨
     try:
-        with get_central_db_connection(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row # 确保可以按列名访问
-            cursor = conn.cursor()
-            
-            # 1. 从 failed_log 获取信息
-            cursor.execute("SELECT item_name, item_type, score FROM failed_log WHERE item_id = ?", (item_id,))
-            failed_item_info = cursor.fetchone()
-            
-            # 2. 从 failed_log 删除
-            cursor.execute("DELETE FROM failed_log WHERE item_id = ?", (item_id,))
-            deleted_count = cursor.rowcount
-            
-            # 3. 如果删除成功，则添加到 processed_log
-            if deleted_count > 0 and failed_item_info:
-                score_to_save = failed_item_info["score"] if failed_item_info["score"] is not None else 10.0
-                item_name = failed_item_info["item_name"]
-                
-                cursor.execute(
-                    "REPLACE INTO processed_log (item_id, item_name, processed_at, score) VALUES (?, ?, CURRENT_TIMESTAMP, ?)",
-                    (item_id, item_name, score_to_save)
-                )
-                logger.info(f"项目 {item_id} ('{item_name}') 已标记为已处理，并移至已处理日志 (评分: {score_to_save})。")
-
-            # 4. 所有操作成功，提交事务
-            conn.commit()
-            # with 代码块结束，连接自动关闭
+        # +++ 核心修改：调用 db_handler 的高级函数 +++
+        success = db_handler.mark_review_item_as_processed(
+            db_path=config_manager.DB_PATH,
+            item_id=item_id
+        )
+        
+        if success:
+            return jsonify({"message": f"项目 {item_id} 已成功标记为已处理。"}), 200
+        else:
+            return jsonify({"error": f"未在待复核列表中找到项目 {item_id}。"}), 404
 
     except Exception as e:
-        # 如果 with 块内任何地方出错，未提交的更改会自动回滚
         logger.error(f"标记项目 {item_id} 为已处理时失败: {e}", exc_info=True)
         return jsonify({"error": "服务器内部错误"}), 500
-    # ✨✨✨ 修改结束 ✨✨✨
+# ✨✨✨ 清空待复核列表（并全部标记为已处理）的 API ✨✨✨
+@app.route('/api/actions/clear_review_items', methods=['POST'])
+@task_lock_required
+def api_clear_review_items_revised():
+    logger.info("API: 收到清空所有待复核项目并标记为已处理的请求。")
     
-    # 根据事务执行的结果返回响应
-    if deleted_count > 0:
-        return jsonify({"message": f"项目 {item_id} 已成功标记为已处理。"}), 200
-    else:
-        return jsonify({"error": f"未在待复核列表中找到项目 {item_id}。"}), 404
+    try:
+        # +++ 核心修改：调用 db_handler 的高级函数 +++
+        processed_count = db_handler.clear_all_review_items(config_manager.DB_PATH)
+        
+        if processed_count > 0:
+            message = f"操作成功！已将 {processed_count} 个项目从待复核列表移至已处理列表。"
+        else:
+            message = "操作完成，待复核列表本就是空的。"
+            
+        logger.info(message)
+        return jsonify({"message": message}), 200
+
+    except RuntimeError as e:
+        # 捕获我们自己定义的、用于数据不一致的特定错误
+        logger.error(f"清空待复核列表时发生数据一致性错误: {e}")
+        return jsonify({"error": "服务器在处理数据时检测到不一致性，操作已自动取消以防止数据丢失。"}), 500
+    except Exception as e:
+        logger.error(f"清空并标记待复核列表时发生未知异常: {e}", exc_info=True)
+        return jsonify({"error": "服务器在处理数据库时发生内部错误"}), 500
 # --- 前端全量扫描接口 ---   
 @app.route('/api/trigger_full_scan', methods=['POST'])
 @processor_ready_required # <-- 检查处理器是否就绪
@@ -2018,7 +2183,7 @@ def api_handle_trigger_full_scan():
     force_reprocess = request.form.get('force_reprocess_all') == 'on'
     
 
-    # ★★★ 您的完美逻辑在这里实现 ★★★
+    # ★★★ 你的完美逻辑在这里实现 ★★★
     if force_reprocess:
         logger.info("API: 检测到“强制重处理”选项，将在任务开始前清空已处理日志。")
         try:
@@ -2034,13 +2199,13 @@ def api_handle_trigger_full_scan():
         action_message += " (已清空已处理记录)"
 
     # 从全局配置获取处理深度
-    process_episodes = APP_CONFIG.get('process_episodes', True)
+    process_episodes = config_manager.APP_CONFIG.get('process_episodes', True)
     
     # 提交纯粹的扫描任务
-    submit_task_to_queue(
-        task_process_full_library, # 调用简化后的任务函数
+    success = task_manager.submit_task(
+        task_process_full_library,
         action_message,
-        process_episodes # 不再需要传递 force_reprocess
+        process_episodes
     )
     
     return jsonify({"message": f"{action_message} 任务已提交启动。"}), 202
@@ -2053,27 +2218,40 @@ def api_handle_trigger_sync_map():
         # ★★★ 核心修复：不再需要 full_sync，因为同步逻辑已经统一 ★★★
         task_name_for_api = "同步演员映射表"
         
-        submit_task_to_queue(
+        success = task_manager.submit_task(
             task_sync_person_map,
-            task_name_for_api
+            "同步演员映射表"
         )
 
         return jsonify({"message": f"'{task_name_for_api}' 任务已提交启动。"}), 202
     except Exception as e:
         logger.error(f"API /api/trigger_sync_person_map error: {e}", exc_info=True)
         return jsonify({"error": "启动同步映射表时发生服务器内部错误"}), 500
-
 @app.route('/api/trigger_stop_task', methods=['POST'])
 def api_handle_trigger_stop_task():
     logger.debug("API Endpoint: Received request to stop current task.")
+    
+    stopped_any = False
+    # --- ★★★ 核心修复：尝试停止所有可能的处理器 ★★★ ---
     if media_processor_instance:
         media_processor_instance.signal_stop()
+        stopped_any = True
+        
+    if watchlist_processor_instance:
+        watchlist_processor_instance.signal_stop()
+        stopped_any = True
+
+    if actor_subscription_processor_instance:
+        actor_subscription_processor_instance.signal_stop()
+        stopped_any = True
+    # --- 修复结束 ---
+
+    if stopped_any:
         logger.info("已发送停止信号给当前正在运行的任务。")
         return jsonify({"message": "已发送停止任务请求。"}), 200
     else:
-        logger.warning("API: MediaProcessor 未初始化，无法发送停止信号。")
+        logger.warning("API: 没有任何处理器实例被初始化，无法发送停止信号。")
         return jsonify({"error": "核心处理器未就绪"}), 503
-    
 # ✨✨✨ 保存手动编辑结果的 API ✨✨✨
 @app.route('/api/update_media_cast_sa/<item_id>', methods=['POST'])
 @login_required
@@ -2086,7 +2264,7 @@ def api_update_edited_cast_sa(item_id):
     edited_cast = data["cast"]
     item_name = data.get("item_name", f"未知项目(ID:{item_id})")
 
-    submit_task_to_queue(
+    success = task_manager.submit_task(
         task_manual_update, # 传递包装函数
         f"手动更新: {item_name}",
         # --- 后面是传递给 task_manual_update 的参数 ---
@@ -2109,7 +2287,7 @@ def api_update_edited_cast_api(item_id):
         logger.info(f"API: 收到为 ItemID {item_id} 更新演员的请求，共 {len(edited_cast_from_frontend)} 位演员。")
 
         # ✨✨✨ 1. 使用 with 语句，在所有操作开始前获取数据库连接 ✨✨✨
-        with get_central_db_connection(DB_PATH) as conn:
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
             cursor = conn.cursor()
 
             # ✨✨✨ 2. 手动开启一个事务 ✨✨✨
@@ -2166,100 +2344,171 @@ def api_update_edited_cast_api(item_id):
     except Exception as outer_e:
         logger.error(f"API /api/update_media_cast 顶层错误 for {item_id}: {outer_e}", exc_info=True)
         return jsonify({"error": "保存演员信息时发生服务器内部错误"}), 500
-# ★★★ 导出演员映射表 + 元数据 ★★★
-@app.route('/api/actors/export', methods=['GET'])
+# ★★★ 获取数据库中所有用户表的列表 ★★★
+@app.route('/api/database/tables', methods=['GET'])
 @login_required
-def api_export_person_map():
+def api_get_db_tables():
     """
-    【V2 - 元数据增强版】导出演员身份映射表和TMDb元数据缓存。
+    获取数据库中所有用户表的名称列表。
+    排除 sqlite_ 开头的系统表。
     """
-    # ★★★ 1. 扩展表头，加入 ActorMetadata 的字段 ★★★
-    headers = [
-        'primary_name', 
-        'tmdb_person_id', 'imdb_id', 'douban_celebrity_id',
-        'profile_path', 'gender', 'adult', 'popularity', 'original_name'
-    ]
-    logger.info(f"API: 收到导出完整演员数据 (map + metadata) 的请求。")
+    try:
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
+            cursor = conn.cursor()
+            # 查询 sqlite_master 表来获取所有表名
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            tables = [row[0] for row in cursor.fetchall()]
+            logger.info(f"API: 成功获取到数据库表列表: {tables}")
+            return jsonify(tables)
+    except Exception as e:
+        logger.error(f"获取数据库表列表时出错: {e}", exc_info=True)
+        return jsonify({"error": "无法获取数据库表列表"}), 500
+# 数据库表结构。
+TABLE_PRIMARY_KEYS = {
+    "person_identity_map": "tmdb_person_id",
+    "ActorMetadata": "tmdb_id",
+    "translation_cache": "original_text",
+    "collections_info": "emby_collection_id",
+    "watchlist": "item_id",
+    "actor_subscriptions": "tmdb_person_id",
+    "tracked_actor_media": ("subscription_id", "tmdb_media_id"),
+    "processed_log": "item_id",
+    "failed_log": "item_id",
+    "users": "username",
+}
+# ★★★ 通用数据库表导出  ★★★
+@app.route('/api/database/export', methods=['POST'])
+@login_required
+def api_export_database():
+    """
+    【通用版】根据请求中指定的表名列表，导出一个包含这些表数据的JSON文件。
+    """
+    try:
+        tables_to_export = request.json.get('tables')
+        if not tables_to_export or not isinstance(tables_to_export, list):
+            return jsonify({"error": "请求体中必须包含一个 'tables' 数组"}), 400
 
-    def generate_csv():
-        string_io = StringIO()
-        try:
-            with get_central_db_connection(DB_PATH) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                writer = csv.DictWriter(string_io, fieldnames=headers, extrasaction='ignore')
+        logger.info(f"API: 收到数据库导出请求，目标表: {tables_to_export}")
+
+        backup_data = {
+            "metadata": {
+                "export_date": datetime.utcnow().isoformat() + "Z",
+                "app_version": constants.APP_VERSION,
+                "source_emby_server_id": EMBY_SERVER_ID,
+                "tables": tables_to_export
+            },
+            "data": {}
+        }
+
+        with get_central_db_connection(config_manager.DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            for table_name in tables_to_export:
+                # 安全性检查：确保表名是合法的
+                if not re.match(r'^[a-zA-Z0-9_]+$', table_name):
+                     logger.warning(f"跳过无效的表名: {table_name}")
+                     continue
                 
-                writer.writeheader()
-                yield string_io.getvalue()
-                string_io.seek(0); string_io.truncate(0)
+                logger.debug(f"正在导出表: {table_name}...")
+                cursor.execute(f"SELECT * FROM {table_name}")
+                rows = cursor.fetchall()
+                backup_data["data"][table_name] = [dict(row) for row in rows]
+                logger.debug(f"表 {table_name} 导出完成，共 {len(rows)} 行。")
 
-                # ★★★ 2. 改造SQL查询，使用 LEFT JOIN 合并两张表 ★★★
-                query = """
-                    SELECT
-                        p.primary_name,
-                        p.tmdb_person_id,
-                        p.imdb_id,
-                        p.douban_celebrity_id,
-                        m.profile_path,
-                        m.gender,
-                        m.adult,
-                        m.popularity,
-                        m.original_name
-                    FROM
-                        person_identity_map AS p
-                    LEFT JOIN
-                        ActorMetadata AS m ON p.tmdb_person_id = m.tmdb_id
-                """
-                cursor.execute(query)
-                
-                for row in cursor:
-                    writer.writerow(dict(row))
-                    yield string_io.getvalue()
-                    string_io.seek(0); string_io.truncate(0)
-        except Exception as e:
-            logger.error(f"导出完整演员数据时发生错误: {e}", exc_info=True)
-            yield f"Error: {e}"
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"database_backup_{timestamp}.json"
+        
+        json_output = json.dumps(backup_data, indent=2, ensure_ascii=False)
 
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    filename = f"full_actor_data_backup_{timestamp}.csv" # 文件名也更新一下
-    
-    response = Response(stream_with_context(generate_csv()), mimetype='text/csv; charset=utf-8')
-    response.headers.set("Content-Disposition", "attachment", filename=filename)
-    return response
-# ★★★ 导入演员映射表 ★★★
-@app.route('/api/actors/import', methods=['POST'])
+        response = Response(json_output, mimetype='application/json; charset=utf-8')
+        response.headers.set("Content-Disposition", "attachment", filename=filename)
+        return response
+
+    except Exception as e:
+        logger.error(f"导出数据库时发生错误: {e}", exc_info=True)
+        return jsonify({"error": f"导出时发生服务器错误: {e}"}), 500
+# ★★★ 通用数据库表导入 ★★★
+@app.route('/api/database/import', methods=['POST'])
 @login_required
 @task_lock_required
-def api_import_person_map():
+def api_import_database():
     """
-    【队列版】接收上传的CSV文件，读取内容，并提交一个后台任务来处理它。
+    【通用队列版】接收备份文件、要导入的表名列表以及导入模式，
+    并提交一个后台任务来处理恢复。
     """
     if 'file' not in request.files:
         return jsonify({"error": "请求中未找到文件部分"}), 400
     
     file = request.files['file']
-    if not file.filename or not file.filename.endswith('.csv'):
-        return jsonify({"error": "未选择文件或文件类型不正确"}), 400
+    if not file.filename or not file.filename.endswith('.json'):
+        return jsonify({"error": "未选择文件或文件类型必须是 .json"}), 400
+
+    tables_to_import_str = request.form.get('tables')
+    if not tables_to_import_str:
+        return jsonify({"error": "必须通过 'tables' 字段指定要导入的表"}), 400
+    tables_to_import = [table.strip() for table in tables_to_import_str.split(',')]
+
+    # ★ 关键：从表单获取导入模式，默认为 'merge'，更安全 ★
+    import_mode = request.form.get('mode', 'merge').lower()
+    if import_mode not in ['overwrite', 'merge']:
+        return jsonify({"error": "无效的导入模式。只支持 'overwrite' 或 'merge'"}), 400
+    
+    mode_translations = {
+        'overwrite': '本地恢复模式',
+        'merge': '共享合并模式',
+    }
+    # 使用 .get() 以防万一，如果找不到就用回英文原名
+    import_mode_cn = mode_translations.get(import_mode, import_mode)
 
     try:
-        # 1. 直接将文件内容读入内存字符串
         file_content = file.stream.read().decode("utf-8-sig")
-        logger.info(f"已接收上传文件 '{file.filename}'，内容长度: {len(file_content)}")
+        # ▼▼▼ 新增的安全校验逻辑 ▼▼▼
+        backup_json = json.loads(file_content)
+        backup_metadata = backup_json.get("metadata", {})
+        backup_server_id = backup_metadata.get("source_emby_server_id")
 
-        # 2. 提交一个后台任务，把文件内容和需要的配置传过去
-        submit_task_to_queue(
-            task_import_person_map,
-            "导入演员映射表",
-            # ★★★ 把任务需要的所有东西，都作为关键字参数传递 ★★★
+        # 只对最危险的“本地恢复”模式进行强制校验
+        if import_mode == 'overwrite':
+            # 检查1：备份文件必须有ID指纹
+            if not backup_server_id:
+                error_msg = "此备份文件缺少来源服务器ID，为安全起见，禁止使用“本地恢复”模式导入，这通常意味着它是一个旧版备份，请使用“共享合并”模式。"
+                logger.warning(f"禁止导入: {error_msg}")
+                return jsonify({"error": error_msg}), 403 # 403 Forbidden
+
+            # 检查2：当前服务器必须能获取到ID
+            current_server_id = EMBY_SERVER_ID
+            if not current_server_id:
+                error_msg = "无法获取当前Emby服务器的ID，可能连接已断开。为安全起见，暂时禁止使用“本地恢复”模式。"
+                logger.warning(f"禁止导入: {error_msg}")
+                return jsonify({"error": error_msg}), 503 # 503 Service Unavailable
+
+            # 检查3：两个ID必须完全匹配
+            if backup_server_id != current_server_id:
+                error_msg = (f"服务器ID不匹配！此备份来自另一个Emby服务器，"
+                           "直接使用“本地恢复”会造成数据严重混乱。操作已禁止。\n\n"
+                           f"备份来源ID: ...{backup_server_id[-12:]}\n"
+                           f"当前服务器ID: ...{current_server_id[-12:]}\n\n"
+                           "如果你确实想合并数据，请改用“共享合并”模式。")
+                logger.warning(f"禁止导入: {error_msg}")
+                return jsonify({"error": error_msg}), 403 # 403 Forbidden
+        # ▲▲▲ 安全校验逻辑结束 ▲▲▲
+        logger.trace(f"已接收上传的备份文件 '{file.filename}'，将以 '{import_mode_cn}' 模式导入表: {tables_to_import}")
+
+        success = task_manager.submit_task(
+            task_import_database,  # ★ 调用新的后台任务函数
+            f"以 {import_mode_cn} 模式恢复数据库表",
+            # 传递任务所需的所有参数
             file_content=file_content,
-            tmdb_api_key=app.config.get("tmdb_api_key", "")
+            tables_to_import=tables_to_import,
+            import_mode=import_mode
         )
         
-        return jsonify({"message": "文件上传成功，已提交到后台队列进行导入。"}), 202
+        return jsonify({"message": f"文件上传成功，已提交后台任务以 '{import_mode_cn}' 模式恢复 {len(tables_to_import)} 个表。"}), 202
 
     except Exception as e:
-        logger.error(f"处理导入文件请求时发生错误: {e}", exc_info=True)
-        return jsonify({"error": f"处理上传文件时发生服务器错误"}), 500
+        logger.error(f"处理数据库导入请求时发生错误: {e}", exc_info=True)
+        return jsonify({"error": "处理上传文件时发生服务器错误"}), 500
 # ✨✨✨ 编辑页面的API接口 ✨✨✨
 @app.route('/api/media_for_editing_sa/<item_id>', methods=['GET'])
 @login_required
@@ -2287,7 +2536,7 @@ def api_parse_cast_from_url():
         return jsonify({"error": "请求中未提供 'url' 参数"}), 400
 
     try:
-        current_config = APP_CONFIG
+        current_config = config_manager.APP_CONFIG
         headers = {'User-Agent': current_config.get('user_agent', '')}
         parsed_cast = parse_cast_from_url(url_to_parse, custom_headers=headers)
         
@@ -2386,27 +2635,30 @@ def api_preview_processed_cast(item_id):
 def proxy_emby_image(image_path):
     """
     一个安全的、动态的 Emby 图片代理。
+    【V2 - 完整修复版】确保 api_key 作为 URL 参数传递，适用于所有图片类型。
     """
     try:
-        # 从已加载的配置中获取 Emby URL 和 API Key
         emby_url = media_processor_instance.emby_url.rstrip('/')
         emby_api_key = media_processor_instance.emby_api_key
 
+        # 1. 构造基础 URL，包含路径和原始查询参数
         query_string = request.query_string.decode('utf-8')
         target_url = f"{emby_url}/{image_path}"
         if query_string:
             target_url += f"?{query_string}"
         
-        headers = {
-            'X-Emby-Token': emby_api_key,
-            'User-Agent': request.headers.get('User-Agent', 'EmbyActorProcessorProxy/1.0')
-        }
+        # 2. ★★★ 核心修复：将 api_key 作为 URL 参数追加 ★★★
+        # 判断是使用 '?' 还是 '&' 来追加 api_key
+        separator = '&' if '?' in target_url else '?'
+        target_url_with_key = f"{target_url}{separator}api_key={emby_api_key}"
         
-        logger.trace(f"代理图片请求: {target_url}")
+        logger.trace(f"代理图片请求 (最终URL): {target_url_with_key}")
 
-        emby_response = requests.get(target_url, headers=headers, stream=True, timeout=20)
+        # 3. 发送请求
+        emby_response = requests.get(target_url_with_key, stream=True, timeout=20)
         emby_response.raise_for_status()
 
+        # 4. 将 Emby 的响应流式传输回浏览器
         return Response(
             stream_with_context(emby_response.iter_content(chunk_size=8192)),
             content_type=emby_response.headers.get('Content-Type'),
@@ -2414,265 +2666,44 @@ def proxy_emby_image(image_path):
         )
     except Exception as e:
         logger.error(f"代理 Emby 图片时发生严重错误: {e}", exc_info=True)
-        # 返回一个占位符图片
+        # 返回一个1x1的透明像素点作为占位符，避免显示大的裂图图标
         return Response(
             b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82',
             mimetype='image/png'
         )
-# ✨✨✨ 清空待复核列表（并全部标记为已处理）的 API ✨✨✨
-@app.route('/api/actions/clear_review_items', methods=['POST'])
-@task_lock_required
-def api_clear_review_items_revised():
-    logger.info("API: 收到清空所有待复核项目并标记为已处理的请求。")
-    
-    # 首先，在事务外部获取初始计数，用于最终验证
-    try:
-        with get_central_db_connection(DB_PATH) as pre_check_conn:
-            initial_count = pre_check_conn.execute("SELECT COUNT(*) FROM failed_log").fetchone()[0]
-            logger.info(f"防御性检查：在事务开始前，'failed_log' 表中有 {initial_count} 条记录。")
-            if initial_count == 0:
-                message = "操作完成，待复核列表本就是空的。"
-                logger.info(message)
-                return jsonify({"message": message}), 200
-    except Exception as e_check:
-        logger.error(f"数据库预检查失败: {e_check}")
-        return jsonify({"error": "服务器在预检查数据库时发生内部错误"}), 500
-
-    copied_count = 0
-    deleted_count = 0
-
-    try:
-        with get_central_db_connection(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            # 1. 将所有 failed_log 中的项目信息复制到 processed_log
-            copy_sql = """
-                REPLACE INTO processed_log (item_id, item_name, processed_at, score)
-                SELECT
-                    item_id,
-                    item_name,
-                    CURRENT_TIMESTAMP,
-                    COALESCE(score, 10.0)
-                FROM
-                    failed_log;
-            """
-            cursor.execute(copy_sql)
-            # ▲▲▲ 关键改动(1)：获取 REPLACE 操作影响的行数
-            copied_count = cursor.rowcount 
-            logger.info(f"事务内：尝试从 '待复核' 复制 {copied_count} 条记录到 '已处理'。")
-
-            # 2. 清空 failed_log 表
-            cursor.execute("DELETE FROM failed_log")
-            deleted_count = cursor.rowcount # 获取 DELETE 操作影响的行数
-            logger.info(f"事务内：尝试从 '待复核' 删除 {deleted_count} 条记录。")
-            
-            # ▲▲▲ 关键改动(2)：添加验证逻辑
-            # 只有当复制的记录数和删除的记录数相等，且与初始数量一致时，才提交事务。
-            # 这可以防止源数据被删除但目标数据未成功写入的情况。
-            if copied_count == deleted_count and initial_count == deleted_count:
-                conn.commit() # 验证通过，提交事务
-                logger.info(f"数据一致性验证成功 ({copied_count} == {deleted_count})，事务已提交。")
-            else:
-                conn.rollback() # 验证失败，回滚事务
-                logger.error(
-                    f"数据不一致，事务已回滚！"
-                    f"初始数量: {initial_count}, "
-                    f"尝试复制: {copied_count}, "
-                    f"尝试删除: {deleted_count}."
-                )
-                return jsonify({"error": "服务器在处理数据时检测到不一致性，操作已自动取消以防止数据丢失。"}), 500
-
-    except Exception as e:
-        # 如果 with 块内任何地方出错，未提交的更改会自动回滚
-        logger.error(f"清空并标记待复核列表时发生未知异常: {e}", exc_info=True)
-        return jsonify({"error": "服务器在处理数据库时发生内部错误"}), 500
-    
-    # 根据事务执行的结果返回响应
-    # 如果代码执行到这里，意味着事务是成功提交的
-    message = f"操作成功！已将 {deleted_count} 个项目从待复核列表移至已处理列表。"
-    logger.info(message)
-    return jsonify({"message": message}), 200
-
-# # ★★★ 获取追剧列表的API ★★★
-@app.route('/api/watchlist', methods=['GET']) 
-@login_required
-def api_get_watchlist():
-    # 模式检查
-
-    logger.debug("API: 收到获取追剧列表的请求。")
-    
-    # ✨✨✨ 核心修改在这里 ✨✨✨
-    try:
-        with get_central_db_connection(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row # 确保可以按列名访问
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM watchlist ORDER BY added_at DESC")
-            items = [dict(row) for row in cursor.fetchall()]
-        # with 代码块结束，连接自动关闭
-        
-        return jsonify(items)
-        
-    except Exception as e:
-        logger.error(f"获取追剧列表时发生错误: {e}", exc_info=True)
-        return jsonify({"error": "获取追剧列表时发生服务器内部错误"}), 500
-    # ✨✨✨ 修改结束 ✨✨✨
-# ★★★ 新增：手动添加到追剧列表的API ★★★
-@app.route('/api/watchlist/add', methods=['POST'])
-@login_required
-def api_add_to_watchlist():
-    data = request.json
-    item_id = data.get('item_id')
-    tmdb_id = data.get('tmdb_id')
-    item_name = data.get('item_name')
-    item_type = data.get('item_type')
-
-    if not all([item_id, tmdb_id, item_name, item_type]):
-        return jsonify({"error": "缺少必要的项目信息"}), 400
-    
-    if item_type != 'Series':
-        return jsonify({"error": "只能将'剧集'类型添加到追剧列表"}), 400
-
-    logger.info(f"API: 收到手动添加 '{item_name}' 到追剧列表的请求。")
-    
-    # ✨✨✨ 核心修改在这里 ✨✨✨
-    try:
-        with get_central_db_connection(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                INSERT OR REPLACE INTO watchlist (item_id, tmdb_id, item_name, item_type, status, last_checked_at)
-                VALUES (?, ?, ?, ?, 'Watching', NULL)
-            """, (item_id, tmdb_id, item_name, item_type))
-            
-            conn.commit()
-        # with 代码块结束，连接自动关闭
-        
-        return jsonify({"message": f"《{item_name}》已成功添加到追剧列表！"}), 200
-        
-    except Exception as e:
-        # 如果 with 块内任何地方出错，未提交的更改会自动回滚
-        logger.error(f"手动添加项目到追剧列表时发生错误: {e}", exc_info=True)
-        return jsonify({"error": "服务器在添加时发生内部错误"}), 500
-    # ✨✨✨ 修改结束 ✨✨✨
-
-#★★★ 手动触发追剧列表更新的API ★★★
-@app.route('/api/watchlist/trigger_full_update', methods=['POST']) 
-@login_required
-def api_trigger_watchlist_update(): # <-- 函数名可以不变，因为它和路径无关了
-    # 模式检查
-
-    # ... (这个函数的内部逻辑完全不变) ...
-    
-    logger.info("API: 收到手动触发追剧列表更新的请求。")
-    submit_task_to_queue(
-        task_process_watchlist,
-        "手动追剧更新"
-    )
-    return jsonify({"message": "追剧列表更新任务已在后台启动！"}), 202
-# ★★★ 新增：手动更新追剧状态的API ★★★
-@app.route('/api/watchlist/update_status', methods=['POST'])
-@login_required
-@task_lock_required
-def api_update_watchlist_status():
-    # 1. 检查任务锁，防止并发写入
-    data = request.json
-    item_id = data.get('item_id')
-    new_status = data.get('new_status')
-
-    if not item_id or new_status not in ['Watching', 'Ended', 'Paused']:
-        return jsonify({"error": "请求参数无效"}), 400
-
-    logger.info(f"API: 收到请求，将项目 {item_id} 的追剧状态更新为 '{new_status}'。")
-    try:
-        with get_central_db_connection(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE watchlist SET status = ? WHERE item_id = ?",
-                (new_status, item_id)
-            )
-            conn.commit()
-            if cursor.rowcount == 0:
-                logger.warning(f"尝试更新追剧状态，但未在列表中找到项目 {item_id}。")
-                return jsonify({"error": "未在追剧列表中找到该项目"}), 404
-        
-        return jsonify({"message": "状态更新成功"}), 200
-        
-    except Exception as e:
-        logger.error(f"更新追剧状态时发生错误: {e}", exc_info=True)
-        return jsonify({"error": "服务器在更新状态时发生内部错误"}), 500
-
-
-# ★★★ 新增：手动从追剧列表移除的API ★★★
-@app.route('/api/watchlist/remove/<item_id>', methods=['POST'])
-@login_required
-@task_lock_required
-def api_remove_from_watchlist(item_id):
-    logger.info(f"API: 收到请求，将项目 {item_id} 从追剧列表移除。")
-    
-    # ✨✨✨ 核心修改在这里 ✨✨✨
-    try:
-        # 1. 将 with 语句放在 try 块内部
-        with get_central_db_connection(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            logger.debug(f"准备执行 DELETE FROM watchlist WHERE item_id = {item_id}")
-            cursor.execute("DELETE FROM watchlist WHERE item_id = ?", (item_id,))
-            
-            # 2. 检查操作是否成功
-            if cursor.rowcount > 0:
-                logger.info(f"成功执行 DELETE 语句，影响行数: {cursor.rowcount}。准备提交...")
-                conn.commit()
-                logger.info("数据库事务已提交。")
-                return jsonify({"message": "已从追剧列表移除"}), 200
-            else:
-                logger.warning(f"尝试删除项目 {item_id}，但在数据库中未找到匹配项。")
-                return jsonify({"error": "未在追剧列表中找到该项目"}), 404
-            
-    # 3. 保留你精心设计的、精细化的异常处理块
-    except sqlite3.OperationalError as e:
-        if "database is locked" in str(e).lower():
-            logger.error(f"从追剧列表移除项目时发生数据库锁定错误: {e}", exc_info=True)
-            return jsonify({"error": "数据库当前正忙，请稍后再试。"}), 503
-        else:
-            logger.error(f"从追剧列表移除项目时发生数据库操作错误: {e}", exc_info=True)
-            return jsonify({"error": "移除项目时发生数据库操作错误"}), 500
-            
-    except Exception as e:
-        logger.error(f"从追剧列表移除项目时发生未知错误: {e}", exc_info=True)
-        return jsonify({"error": "移除项目时发生未知的服务器内部错误"}), 500
-    # 4. 不再需要 finally 块，因为 with 语句已经处理了连接关闭
-    # ✨✨✨ 修改结束 ✨✨✨
-# ★★★ 新增：手动触发单项追剧更新的API ★★★
-@app.route('/api/watchlist/trigger_update/<item_id>/', methods=['POST'])
-@login_required
-@task_lock_required
-def api_trigger_single_watchlist_update(item_id):
-    logger.info(f"API: 收到对单个项目 {item_id} 的追剧更新请求。")
-    if not watchlist_processor_instance:
-        return jsonify({"error": "追剧处理模块未就绪"}), 503
-
-    # 我们需要一个新的、只处理单个项目的任务函数
-    # 我们在下面定义它
-    submit_task_to_queue(
-        task_process_single_watchlist_item,
-        f"手动单项追剧更新: {item_id}",
-        item_id # 把 item_id 作为参数传给任务
-    )
-    
-    return jsonify({"message": f"项目 {item_id} 的更新任务已在后台启动！"}), 202
 # ★★★ 重新处理单个项目 ★★★
 @app.route('/api/actions/reprocess_item/<item_id>', methods=['POST'])
 @login_required
 @task_lock_required # <-- 检查任务锁
 def api_reprocess_item(item_id):
-    logger.info(f"API: 收到重新处理项目 '{item_id}' 的请求。")
-    submit_task_to_queue(
-        task_reprocess_single_item,
-        f"重新处理: {item_id}",
-        item_id
-    )
-    return jsonify({"message": f"重新处理项目 '{item_id}' 的任务已提交。"}), 202
+    """
+    【最终版 - 职责分离】启动单个项目重新处理的API接口。
+    此版本只负责提交任务和设置一个简单的“已提交”状态。
+    """
+    global media_processor_instance
 
+    logger.info(f"API: 收到重新处理项目 '{item_id}' 的请求。")
+    
+    # 仍然需要获取名称，以便传递给后台任务
+    item_details = emby_handler.get_emby_item_details(
+        item_id,
+        media_processor_instance.emby_url,
+        media_processor_instance.emby_api_key,
+        media_processor_instance.emby_user_id
+    )
+    item_name_for_ui = item_details.get("Name", f"ItemID: {item_id}") if item_details else f"ItemID: {item_id}"
+
+    logger.info(f"API: 将为 '{item_name_for_ui}' 提交重新处理任务。")
+
+    # ✨ 关键修改：设置一个非常简单的初始状态，避免与后台任务冲突
+    success = task_manager.submit_task(
+        task_reprocess_single_item,
+        f"任务已提交: {item_name_for_ui}",  # <--- 只说“已提交”
+        item_id,
+        item_name_for_ui  # 将友好名称作为参数传递给后台任务
+    )
+    
+    return jsonify({"message": f"重新处理项目 '{item_name_for_ui}' 的任务已提交。"}), 202
 # ★★★ 重新处理所有待复核项 ★★★
 @app.route('/api/actions/reprocess_all_review_items', methods=['POST'])
 @login_required
@@ -2684,7 +2715,7 @@ def api_reprocess_all_review_items():
     """
     logger.info("API: 收到重新处理所有待复核项的请求。")
     # 提交一个宏任务，让后台线程来做这件事
-    submit_task_to_queue(
+    success = task_manager.submit_task(
         task_reprocess_all_review_items, # <--- 我们需要创建这个新的任务函数
         "重新处理所有待复核项"
     )
@@ -2699,7 +2730,7 @@ def api_trigger_full_image_sync():
     """
     提交一个任务，用于全量同步所有已处理项目的海报。
     """
-    submit_task_to_queue(
+    success = task_manager.submit_task(
         task_full_image_sync,
         "全量同步媒体库海报"
     )
@@ -2717,7 +2748,7 @@ def trigger_rebuild_actors_task():
     try:
         # 假设你的处理器实例是全局可访问的，或者通过某种方式获取
         # 我们需要把这个函数本身，以及它的名字，提交到队列
-        submit_task_to_queue(
+        success = task_manager.submit_task(
             run_full_rebuild_task, # <--- 传递函数本身
             "重构演员数据库" # <--- 任务名
             # 注意：这里不需要传递 processor 实例，因为 task_worker_function 会自动选择
@@ -2749,18 +2780,12 @@ def api_clear_tmdb_caches():
         return jsonify({"success": False, "message": "服务器在执行清除操作时发生未知错误。"}), 500
 # ✨✨✨ “立即执行”API接口 ✨✨✨
 @app.route('/api/tasks/trigger/<task_identifier>', methods=['POST'])
+@task_lock_required
 def api_trigger_task_now(task_identifier: str):
     """
     一个通用的API端点，用于立即触发指定的后台任务。
     它会响应前端发送的 /api/tasks/trigger/full-scan, /api/tasks/trigger/sync-person-map 等请求。
     """
-    # 1. 检查是否有任务正在运行 (这是双重保险，防止前端禁用逻辑失效)
-    with task_lock:
-        if background_task_status["is_running"]:
-            return jsonify({
-                "status": "error",
-                "message": "已有其他任务正在运行，请稍后再试。"
-            }), 409 # 409 Conflict
 
     # 2. 从任务注册表中查找任务
     task_info = TASK_REGISTRY.get(task_identifier)
@@ -2773,7 +2798,7 @@ def api_trigger_task_now(task_identifier: str):
     task_function, task_name = task_info
     
     # 3. 提交任务到队列
-    #    使用您现有的 submit_task_to_queue 函数
+    #    使用你现有的 submit_task_to_queue 函数
     #    对于需要额外参数的任务（如全量扫描），我们需要特殊处理
     kwargs = {}
     if task_identifier == 'full-scan':
@@ -2783,7 +2808,7 @@ def api_trigger_task_now(task_identifier: str):
         kwargs['process_episodes'] = data.get('process_episodes', True)
         # 假设 task_process_full_library 接受 process_episodes 参数
     
-    submit_task_to_queue(
+    success = task_manager.submit_task(
         task_function,
         task_name,
         **kwargs # 使用字典解包来传递命名参数
@@ -2794,204 +2819,6 @@ def api_trigger_task_now(task_identifier: str):
         "message": "任务已成功提交到后台队列。",
         "task_name": task_name
     }), 202 # 202 Accepted 表示请求已被接受，将在后台处理
-# ▼▼▼ 日志查看器 API 路由 ▼▼▼
-@app.route('/api/logs/list', methods=['GET'])
-@login_required
-def list_log_files():
-    """列出日志目录下的所有日志文件 (app.log*)"""
-    try:
-        # PERSISTENT_DATA_PATH 变量在当前作用域中可以直接使用
-        all_files = os.listdir(LOG_DIRECTORY)
-        log_files = [f for f in all_files if f.startswith('app.log')]
-        
-        # 对日志文件进行智能排序，确保 app.log 在最前，然后是 .1.gz, .2.gz ...
-        def sort_key(filename):
-            if filename == 'app.log':
-                return -1
-            parts = filename.split('.')
-            # 适用于 'app.log.1.gz' 这样的格式
-            if len(parts) > 2 and parts[-1] == 'gz' and parts[-2].isdigit():
-                return int(parts[-2])
-            return float('inf') # 其他不规范的格式排在最后
-
-        log_files.sort(key=sort_key)
-        return jsonify(log_files)
-    except Exception as e:
-        logging.error(f"API: 无法列出日志文件: {e}", exc_info=True)
-        return jsonify({"error": "无法读取日志文件列表"}), 500
-@app.route('/api/logs/view', methods=['GET'])
-@login_required
-def view_log_file():
-    """查看指定日志文件的内容，自动处理 .gz 文件"""
-    # 安全性第一：防止目录遍历攻击
-    filename = secure_filename(request.args.get('filename', ''))
-    if not filename or not filename.startswith('app.log'):
-        abort(403, "禁止访问非日志文件或无效的文件名。")
-
-    full_path = os.path.join(LOG_DIRECTORY, filename)
-
-    # 再次确认最终路径仍然在合法的日志目录下
-    if not os.path.abspath(full_path).startswith(os.path.abspath(LOG_DIRECTORY)):
-        abort(403, "检测到非法路径访问。")
-        
-    if not os.path.exists(full_path):
-        abort(404, "文件未找到。")
-
-    try:
-        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        
-        return Response(content, mimetype='text/plain')
-        
-    except Exception as e:
-        logging.error(f"API: 读取日志文件 '{filename}' 时出错: {e}", exc_info=True)
-        abort(500, f"读取文件 '{filename}' 时发生内部错误。")
-@app.route('/api/logs/search', methods=['GET'])
-@login_required
-def search_all_logs():
-    """
-    在所有日志文件 (app.log*) 中搜索关键词。
-    """
-    query = request.args.get('q', '').strip()
-    if not query:
-        return jsonify({"error": "搜索关键词不能为空"}), 400
-    TIMESTAMP_REGEX = re.compile(r"^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})")
-
-    search_results = []
-    
-    try:
-        # 1. 获取并排序所有日志文件，确保从新到旧搜索
-        all_files = os.listdir(LOG_DIRECTORY)
-        log_files = [f for f in all_files if f.startswith('app.log')]
-        
-        # --- 代码修改点 ---
-        # 简化了排序键，不再处理 .gz 后缀
-        def sort_key(filename):
-            if filename == 'app.log':
-                return -1  # app.log 永远排在最前面
-            parts = filename.split('.')
-            # 适用于 app.log.1, app.log.2 等格式
-            if len(parts) == 3 and parts[0] == 'app' and parts[1] == 'log' and parts[2].isdigit():
-                return int(parts[2])
-            return float('inf') # 其他不符合格式的文件排在最后
-        
-        log_files.sort(key=sort_key)
-
-        # 2. 遍历每个文件进行搜索
-        for filename in log_files:
-            full_path = os.path.join(LOG_DIRECTORY, filename)
-            try:
-                # --- 代码修改点 ---
-                # 移除了 opener 的判断，直接使用 open 函数
-                with open(full_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                    # 逐行读取，避免内存爆炸
-                    for line_num, line in enumerate(f, 1):
-                        # 不区分大小写搜索
-                        if query.lower() in line.lower():
-                            match = TIMESTAMP_REGEX.search(line)
-                            line_date = match.group(1) if match else "" # 如果匹配失败则为空字符串
-                            
-                            # 2. 将提取到的日期添加到返回结果中
-                            search_results.append({
-                                "file": filename,
-                                "line_num": line_num,
-                                "content": line.strip(),
-                                "date": line_date  # <--- 新增的日期字段
-                            })
-            except Exception as e:
-                # 如果单个文件读取失败，记录错误并继续
-                logging.warning(f"API: 搜索时无法读取文件 '{filename}': {e}")
-
-        search_results.sort(key=lambda x: x['date'])
-        return jsonify(search_results)
-
-    except Exception as e:
-        logging.error(f"API: 全局日志搜索时发生严重错误: {e}", exc_info=True)
-        return jsonify({"error": "搜索过程中发生服务器内部错误"}), 500
-@app.route('/api/logs/search_context', methods=['GET'])
-@login_required
-def search_logs_with_context():
-    """
-    【最终修正版】在所有日志文件中定位包含关键词的完整“处理块”，
-    并根据块内的时间戳进行精确排序，同时保留日期信息。
-    """
-    query = request.args.get('q', '').strip()
-    if not query:
-        return jsonify({"error": "搜索关键词不能为空"}), 400
-
-    # 正则表达式保持不变
-    START_MARKER = re.compile(r"成功获取Emby演员 '(.+?)' \(ID: .*?\) 的详情")
-    END_MARKER = re.compile(r"(✨✨✨处理完成|最终状态: 处理完成)")
-    TIMESTAMP_REGEX = re.compile(r"^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})")
-
-    found_blocks = []
-    
-    try:
-        # 获取所有 app.log* 文件，无需预先排序
-        all_files = os.listdir(LOG_DIRECTORY)
-        log_files = [f for f in all_files if f.startswith('app.log')]
-
-        for filename in log_files:
-            full_path = os.path.join(LOG_DIRECTORY, filename)
-            
-            in_block = False
-            current_block = []
-            current_item_name = None
-
-            try:
-                with open(full_path, 'rt', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line: continue
-
-                        is_start_marker = START_MARKER.search(line)
-
-                        if is_start_marker:
-                            if in_block: pass
-                            in_block = True
-                            current_block = [line]
-                            current_item_name = is_start_marker.group(1)
-                        
-                        elif in_block:
-                            current_block.append(line)
-                            
-                            is_end_marker = END_MARKER.search(line)
-                            
-                            if is_end_marker and current_item_name and current_item_name in line:
-                                block_content = "\n".join(current_block)
-                                if query.lower() in block_content.lower():
-                                    
-                                    # ★★★ 核心修改 1: 提取时间戳，并将其存储在名为 'date' 的键中 ★★★
-                                    block_date = "Unknown Date" # 默认值
-                                    if current_block:
-                                        match = TIMESTAMP_REGEX.search(current_block[0])
-                                        if match:
-                                            # match.group(1) 的结果是 "YYYY-MM-DD HH:MM:SS"
-                                            block_date = match.group(1)
-
-                                    found_blocks.append({
-                                        "file": filename,
-                                        "date": block_date, # <--- 使用 'date' 键，前端需要它
-                                        "lines": current_block
-                                    })
-                                
-                                in_block = False
-                                current_block = []
-                                current_item_name = None
-            except Exception as e:
-                logging.warning(f"API: 上下文搜索时无法读取文件 '{filename}': {e}")
-        
-        # ★★★ 核心修改 2: 根据我们刚刚添加的 'date' 键进行排序 ★★★
-        found_blocks.sort(key=lambda x: x['date'])
-        
-        # ★★★ 核心修改 3: 移除那行画蛇添足的 "del" 代码 ★★★
-        # (这里不再有删除键的代码)
-
-        return jsonify(found_blocks)
-
-    except Exception as e:
-        logging.error(f"API: 上下文日志搜索时发生严重错误: {e}", exc_info=True)
-        return jsonify({"error": "搜索过程中发生服务器内部错误"}), 500
 # ★★★ END: 1. ★★★
 #--- 兜底路由，必须放最后 ---
 @app.route('/', defaults={'path': ''})
@@ -3004,18 +2831,23 @@ def serve(path):
     else:
         return send_from_directory(static_folder_path, 'index.html')
     
+# +++ 在应用对象上注册所有蓝图 +++
+app.register_blueprint(watchlist_bp)
+app.register_blueprint(collections_bp)
+app.register_blueprint(actor_subscriptions_bp)
+app.register_blueprint(logs_bp)
 if __name__ == '__main__':
     logger.info(f"应用程序启动... 版本: {constants.APP_VERSION}")
     
-    # 1. ★★★ 首先，加载配置，让 APP_CONFIG 获得真实的值 ★★★
-    load_config()
+    # 1. ★★★ 首先，加载配置，让 config_manager.APP_CONFIG 获得真实的值 ★★★
+    config_manager.load_config()
     
     # 2. ★★★ 然后，再执行依赖于配置的日志设置 ★★★
     # --- 日志文件处理器配置 ---
-    LOG_DIRECTORY = os.path.join(PERSISTENT_DATA_PATH, 'logs')
+    config_manager.LOG_DIRECTORY = os.path.join(config_manager.PERSISTENT_DATA_PATH, 'logs')
 
-    # 从现在已经有值的 APP_CONFIG 中获取配置
-    raw_size = APP_CONFIG.get(
+    # 从现在已经有值的 config_manager.APP_CONFIG 中获取配置
+    raw_size = config_manager.APP_CONFIG.get(
         constants.CONFIG_OPTION_LOG_ROTATION_SIZE_MB, 
         constants.DEFAULT_LOG_ROTATION_SIZE_MB
     )
@@ -3024,7 +2856,7 @@ if __name__ == '__main__':
     except (ValueError, TypeError):
         log_size = constants.DEFAULT_LOG_ROTATION_SIZE_MB
 
-    raw_backups = APP_CONFIG.get(
+    raw_backups = config_manager.APP_CONFIG.get(
         constants.CONFIG_OPTION_LOG_ROTATION_BACKUPS, 
         constants.DEFAULT_LOG_ROTATION_BACKUPS
     )
@@ -3035,7 +2867,7 @@ if __name__ == '__main__':
 
     # 将正确的配置注入日志系统
     add_file_handler(
-        log_directory=LOG_DIRECTORY,
+        log_directory=config_manager.LOG_DIRECTORY,
         log_size_mb=log_size,
         log_backups=log_backups
     )
@@ -3050,7 +2882,7 @@ if __name__ == '__main__':
     initialize_processors()
     
     # 6. 启动后台任务工人
-    start_task_worker_if_not_running()
+    task_manager.start_task_worker_if_not_running()
     
     # 7. 设置定时任务 (它会依赖全局配置和实例)
     if not scheduler.running:

@@ -73,8 +73,15 @@ COPY web_app.py \
      watchlist_processor.py \
      actor_sync_handler.py \
      actor_utils.py \
+     actor_subscription_processor.py \
+     moviepilot_handler.py \
+     config_manager.py \
+     task_manager.py \
+     db_handler.py \
+     extensions.py \
      ./
 
+COPY routes/ ./routes/
 COPY templates/ ./templates/
 
 # 从前端构建阶段拷贝编译好的静态文件

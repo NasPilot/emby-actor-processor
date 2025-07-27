@@ -419,7 +419,7 @@ def get_emby_library_items(
             if user_id:
                 params["UserId"] = user_id
 
-            logger.debug(f"Requesting items from library '{library_name}' (ID: {lib_id}).")
+            logger.trace(f"Requesting items from library '{library_name}' (ID: {lib_id}).")
             
             response = requests.get(api_url, params=params, timeout=30)
             response.raise_for_status()
@@ -434,8 +434,20 @@ def get_emby_library_items(
             logger.error(f"请求库 '{library_name}' 中的项目失败: {e}", exc_info=True)
             continue
 
-    type_to_chinese = {"Movie": "电影", "Series": "电视剧"}
-    media_type_in_chinese = type_to_chinese.get(media_type_filter, media_type_filter or '所有')
+    type_to_chinese = {"Movie": "电影", "Series": "电视剧", "Video": "视频"}
+    media_type_in_chinese = ""
+
+    if media_type_filter:
+        # 分割字符串，例如 "Movie,Series" -> ["Movie", "Series"]
+        types = media_type_filter.split(',')
+        # 为每个类型查找翻译，如果找不到就用原名
+        translated_types = [type_to_chinese.get(t, t) for t in types]
+        # 将翻译后的列表组合成一个字符串，例如 ["电影", "电视剧"] -> "电影、电视剧"
+        media_type_in_chinese = "、".join(translated_types)
+    else:
+        # 如果 media_type_filter 未提供，则为“所有”
+        media_type_in_chinese = '所有'
+
     logger.debug(f"总共从 {len(library_ids)} 个选定库中获取到 {len(all_items_from_selected_libraries)} 个 {media_type_in_chinese} 项目。")
     
     return all_items_from_selected_libraries
@@ -861,7 +873,7 @@ def prepare_actor_translation_data(
     logger.info("【演员数据准备】正在从Emby获取所有演员列表...")
     all_persons = []
     try:
-        # 使用您现有的、高效的 get_all_persons_from_emby 生成器
+        # 使用现有的、高效的 get_all_persons_from_emby 生成器
         person_generator = get_all_persons_from_emby(
             base_url=emby_url,
             api_key=emby_api_key,
@@ -889,7 +901,7 @@ def prepare_actor_translation_data(
     for person in all_persons:
         name = person.get("Name")
         person_id = person.get("Id")
-        # 使用您自己的 utils.contains_chinese
+        # 使用 utils.contains_chinese
         if name and person_id and not utils.contains_chinese(name):
             names_to_translate.add(name)
             if name not in name_to_persons_map:
@@ -906,7 +918,7 @@ def prepare_actor_translation_data(
     logger.info(f"【演员数据准备】正在调用AI批量翻译 {len(names_to_translate)} 个名字...")
     translation_map: Dict[str, str] = {}
     try:
-        # 调用您的AI翻译模块
+        # 调用AI翻译模块
         translation_map = ai_translator.batch_translate(
             texts=list(names_to_translate),
             mode="fast"
@@ -923,3 +935,90 @@ def prepare_actor_translation_data(
     
     # --- 核心修改：返回两个关键的数据结构，而不是执行写回 ---
     return translation_map, name_to_persons_map
+# ✨✨✨ 获取所有合集及其包含的电影 ✨✨✨
+def get_all_collections_with_items(base_url: str, api_key: str, user_id: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    【新】获取 Emby 中所有的电影合集 (BoxSet)，并包含每个合集内的项目。
+    """
+    if not all([base_url, api_key, user_id]):
+        logger.error("get_all_collections_with_items: 缺少必要的参数。")
+        return None
+
+    logger.info("正在从 Emby 获取所有电影合集...")
+    
+    # 1. 首先，获取所有类型为 BoxSet 的项目
+    api_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
+    params = {
+        "api_key": api_key,
+        "IncludeItemTypes": "BoxSet",
+        "Recursive": "true",
+        "Fields": "ProviderIds,Name,ImageTags"
+    }
+    
+    try:
+        response = requests.get(api_url, params=params, timeout=20)
+        response.raise_for_status()
+        collections_data = response.json().get("Items", [])
+        logger.info(f"成功获取到 {len(collections_data)} 个合集。")
+
+        # 2. 遍历每个合集，获取其包含的电影
+        detailed_collections = []
+        for collection in collections_data:
+            collection_id = collection.get("Id")
+            if not collection_id:
+                continue
+
+            logger.debug(f"  正在获取合集 '{collection.get('Name')}' (ID: {collection_id}) 的内容...")
+            
+            # 获取合集下的所有子项目 (即电影)
+            children_url = f"{base_url.rstrip('/')}/Users/{user_id}/Items"
+            children_params = {
+                "api_key": api_key,
+                "ParentId": collection_id,
+                "IncludeItemTypes": "Movie",
+                "Recursive": "true",
+                "Fields": "ProviderIds" # 我们只需要 ProviderIds 来做对比
+            }
+            
+            children_response = requests.get(children_url, params=children_params, timeout=20)
+            children_response.raise_for_status()
+            movies_in_collection = children_response.json().get("Items", [])
+            
+            # 提取已有电影的 TMDb ID
+            existing_movie_tmdb_ids = []
+            for movie in movies_in_collection:
+                tmdb_id = movie.get("ProviderIds", {}).get("Tmdb")
+                if tmdb_id:
+                    existing_movie_tmdb_ids.append(tmdb_id)
+
+            collection['ExistingMovieTmdbIds'] = existing_movie_tmdb_ids
+            detailed_collections.append(collection)
+            
+        return detailed_collections
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"获取 Emby 合集时发生网络错误: {e}", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(f"处理 Emby 合集时发生未知错误: {e}", exc_info=True)
+        return None
+# ✨✨✨ 获取 Emby 服务器信息 (如 Server ID) ✨✨✨
+def get_emby_server_info(base_url: str, api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    【新】获取 Emby 服务器的系统信息，主要用于获取 Server ID。
+    """
+    if not base_url or not api_key:
+        return None
+    
+    api_url = f"{base_url.rstrip('/')}/System/Info"
+    params = {"api_key": api_key}
+    
+    logger.debug("正在获取 Emby 服务器信息...")
+    try:
+        response = requests.get(api_url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return data
+    except Exception as e:
+        logger.error(f"获取 Emby 服务器信息失败: {e}")
+        return None

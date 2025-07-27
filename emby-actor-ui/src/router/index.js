@@ -9,6 +9,8 @@ import EmbySettingsPage from '../components/settings/EmbySettingsPage.vue';
 import SchedulerSettingsPage from '../components/settings/SchedulerSettingsPage.vue';
 import GeneralSettingsPage from '../components/settings/GeneralSettingsPage.vue';
 import WatchlistPage from '../components/WatchlistPage.vue';
+import CollectionsPage from '../components/CollectionsPage.vue';
+import ActorSubscriptionPage from '../components/ActorSubscriptionPage.vue';
 import Login from '../components/Login.vue'; 
 
 // --- 2. 定义路由规则 (修改版) ---
@@ -61,12 +63,23 @@ const routes = [
     component: WatchlistPage,
     meta: { requiresAuth: true },
   },
-  // [修改] 这里是神医模式的编辑页路由
+  {
+    path: '/collections',
+    name: 'Collections',
+    component: CollectionsPage,
+    meta: { requiresAuth: true },
+  },
   {
     path: '/edit-media/:itemId',
     name: 'MediaEditPage', // ✨✨✨ [修改] 将名字改为 MediaEditSA，以明确区分
     component: () => import('../components/MediaEditPage.vue'),
     props: true,
+    meta: { requiresAuth: true },
+  },
+  { 
+    path: '/actor-subscriptions',
+    name: 'ActorSubscriptions',
+    component: ActorSubscriptionPage,
     meta: { requiresAuth: true },
   },
 ];

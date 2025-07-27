@@ -52,12 +52,13 @@ def _tmdb_request(endpoint: str, api_key: str, params: Optional[Dict[str, Any]] 
 # --- 获取电视剧的详细信息 ---
 def get_tv_details_tmdb(tv_id: int, api_key: str, append_to_response: Optional[str] = "credits,videos,images,keywords,external_ids,translations,content_ratings") -> Optional[Dict[str, Any]]:
     """
-    【新增】获取电视剧的详细信息。
+    【已升级】获取电视剧的详细信息。
     """
     endpoint = f"/tv/{tv_id}"
     params = {
         "language": DEFAULT_LANGUAGE,
-        "append_to_response": append_to_response
+        # ★★★ 确保 append_to_response 不为空，即使外部没传 ★★★
+        "append_to_response": append_to_response or "" 
     }
     logger.debug(f"TMDb: 获取电视剧详情 (ID: {tv_id})")
     details = _tmdb_request(endpoint, api_key, params)
@@ -146,4 +147,54 @@ def find_person_by_external_id(external_id: str, api_key: str, source: str = "im
     except requests.exceptions.RequestException as e:
         logger.error(f"TMDb: 通过外部ID查找时发生网络错误: {e}")
         return None
+# --- 获取合集的详细信息 ---
+def get_collection_details_tmdb(collection_id: int, api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    【新】获取指定 TMDb 合集的详细信息，包含其所有影片部分。
+    """
+    if not collection_id or not api_key:
+        return None
+        
+    endpoint = f"/collection/{collection_id}"
+    params = {"language": DEFAULT_LANGUAGE}
+    
+    logger.debug(f"TMDb: 获取合集详情 (ID: {collection_id})")
+    return _tmdb_request(endpoint, api_key, params)
+# --- 搜索演员 ---
+def search_person_tmdb(query: str, api_key: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    【新】通过名字在 TMDb 上搜索演员。
+    """
+    if not query or not api_key:
+        return None
+    endpoint = "/search/person"
+    # 我们可以添加一些参数来优化搜索，比如只搜索非成人内容，并优先中文结果
+    params = {
+        "query": query,
+        "include_adult": "false",
+        "language": DEFAULT_LANGUAGE # 使用模块内定义的默认语言
+    }
+    logger.debug(f"TMDb: 正在搜索演员: '{query}'")
+    data = _tmdb_request(endpoint, api_key, params)
+    return data.get("results") if data else None
+# --- 获取演员的所有影视作品 ---
+def get_person_credits_tmdb(person_id: int, api_key: str) -> Optional[Dict[str, Any]]:
+    """
+    【新】获取一个演员参与的所有电影和电视剧作品。
+    使用 append_to_response 来一次性获取 movie_credits 和 tv_credits。
+    """
+    if not person_id or not api_key:
+        return None
+    
+    endpoint = f"/person/{person_id}"
+    # ★★★ 关键：一次请求同时获取电影和电视剧作品 ★★★
+    params = {
+        "append_to_response": "movie_credits,tv_credits"
+    }
+    logger.trace(f"TMDb: 正在获取演员 (ID: {person_id}) 的所有作品...")
+    
+    # 这里我们直接调用 get_person_details_tmdb，因为它内部已经包含了 _tmdb_request 的逻辑
+    # 并且我们不需要它的其他附加信息，所以第三个参数传我们自己的 append_to_response
+    details = get_person_details_tmdb(person_id, api_key, append_to_response="movie_credits,tv_credits")
 
+    return details
